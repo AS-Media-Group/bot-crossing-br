@@ -17,7 +17,9 @@ import fsp from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import {
+  exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readRecordsUntil, readTail,
+} from '../lib/fsutil.mjs'
 
 const HOME = os.homedir()
 
@@ -81,12 +83,42 @@ const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
 const HEAD_BYTES = 192 * 1024
 
 /**
+ * How far to read for a transcript's opening when the head cannot show it. A pasted prompt of a
+ * couple of hundred thousand characters — an SDK session handed a whole document — is written
+ * twice before any record carries a cwd, which puts the first one half a megabyte in. Bounded,
+ * and paid once per session rather than once per poll: see `openingMeta`.
+ */
+const OPENING_BYTES = 2 * 1024 * 1024
+
+/** The most of a first prompt kept. It stands in for a title and a preview, never for the prompt. */
+const PROMPT_CHARS = 300
+
+/**
  * How recently a session must have done something to count as "active now".
  * A live process on its own is not enough: the desktop app pre-warms idle sessions, so
  * threads untouched for days still hold a CLI process. Measured against real data, the
  * warmed ones sat 16 hours to 3 days idle while genuinely active work was minutes old.
  */
 const ACTIVE_WINDOW_MS = 30 * 60 * 1000
+
+/**
+ * How long a desktop thread with no focus history counts as asking for you. Records the app wrote
+ * before it kept `lastFocusedAt` have no such field, and reading its absence as "never opened" put a
+ * `?` over every one of them — months of threads, all waving. Absent is unknowable, so only a
+ * thread recent enough to plausibly be new is taken as unread on the strength of it: the same three
+ * days after which an astronaut falls asleep anyway.
+ */
+const NEVER_FOCUSED_MS = 3 * 24 * 60 * 60 * 1000
+
+/** How close a desktop thread's creation and a transcript's first record must be to be one event. */
+const SAME_MOMENT_MS = 60 * 1000
+
+/**
+ * How recently a session's subagents must have written for the session to count as working. A
+ * thread that handed the turn back while a background agent or workflow it started carries on has a
+ * quiet transcript — and a busy folder beside it.
+ */
+const BACKGROUND_WINDOW_MS = 2 * 60 * 1000
 
 /**
  * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
@@ -126,7 +158,9 @@ function cleanPrompt(s) {
  * Mirrors the CLI's own title precedence: custom > ai > summary > first prompt.
  */
 function readTranscriptMeta(records) {
-  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0 }
+  const meta = {
+    customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0, rootUuid: '',
+  }
   for (const r of records) {
     if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
     if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
@@ -139,7 +173,12 @@ function readTranscriptMeta(records) {
     }
     if (!meta.firstPrompt && r.type === 'user' && r.message) {
       const text = cleanPrompt(firstText(r.message.content))
-      if (text && !text.startsWith('<')) meta.firstPrompt = text
+      if (text && !text.startsWith('<')) meta.firstPrompt = text.slice(0, PROMPT_CHARS)
+    }
+    // The conversation's first message, by its own id. A transcript the desktop app copied or
+    // imported keeps the ids of the records it copied, so two files sharing this share a conversation.
+    if (!meta.rootUuid && r.type === 'user' && typeof r.uuid === 'string' && r.parentUuid == null) {
+      meta.rootUuid = r.uuid
     }
   }
   return meta
@@ -163,13 +202,43 @@ function projectOf(cwd, originCwd) {
 }
 
 /**
- * Best-effort reverse of the encoding used for project folder names: `-Users-you-Some-Dir`
- * on macOS, `C--Users-you-Some-Dir` on Windows, where the drive's colon became a dash too.
+ * The CLI names a transcript's folder after the cwd it ran in, with every character outside
+ * [A-Za-z0-9] turned into `-`. That cannot be reversed — `/`, ` `, `.`, `_` and `-` all land on the
+ * same character — so a folder name is only ever checked against a real path, never decoded into
+ * one. Decoding it split `my-repo` on a drive called `Work Drive` into four made-up folders, and
+ * the thread claimed a zone of its own named after the last of them.
  */
-function decodeProjectDir(name) {
-  const drive = /^([A-Za-z])--(.*)$/.exec(name)
-  if (drive) return `${drive[1]}:\\${drive[2].replace(/-/g, '\\')}`
-  return name.startsWith('-') ? '/' + name.slice(1).replace(/-/g, '/') : name
+const encodeProjectDir = (p) => String(p).replace(/[^a-zA-Z0-9]/g, '-')
+
+/** What `/.claude/worktrees/` becomes in a folder name, on either separator. */
+const WORKTREE_MARK = '--claude-worktrees-'
+
+/**
+ * The cwd a transcript folder stands for, for the rare transcript that never says where it ran.
+ *
+ * Only paths something on this machine actually reported are candidates — another transcript's
+ * cwd, a desktop record's — and one is taken only if it encodes back to exactly this folder's
+ * name. A worktree's folder is the one case that can be built rather than found: its repo's path,
+ * which a sibling usually knows, plus the worktree's name, which the marker leaves readable. That
+ * name is best-effort (it went through the same lossy encoding) but it only labels the worktree;
+ * the repo, and so the zone, is exact.
+ *
+ * Nothing found is an honest answer: `''` leaves the thread with no folder rather than a made-up
+ * one, and the HUD greys out the folder buttons for it.
+ */
+function resolveProjectDir(name, known) {
+  if (known.has(name)) return known.get(name)
+  const mark = name.lastIndexOf(WORKTREE_MARK)
+  if (mark > 0) {
+    const root = known.get(name.slice(0, mark))
+    if (root) {
+      // Joined in the root's own separator, so the repo half comes back as exactly the string a
+      // sibling reported — which is what the zone is keyed on.
+      const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/'
+      return [root, '.claude', 'worktrees', name.slice(mark + WORKTREE_MARK.length)].join(sep)
+    }
+  }
+  return ''
 }
 
 /** Index every CLI transcript on disk, keyed by session id. */
@@ -194,39 +263,13 @@ async function scanTranscripts() {
 const TAIL_BYTES = 64 * 1024
 
 /**
- * Whether a transcript ends with the turn handed back to you.
- *
- * A live process is not the same thing as work in progress. The CLI holds its process open while
- * it sits at the prompt, so "the pid exists and the file moved recently" marks a thread that
- * finished four minutes ago and asked you a question as *working* — an astronaut hammering away
- * at a thread whose whole point is that it is waiting.
- *
- * The transcript says which it is. A last assistant message that called a tool is mid-turn; one
- * that called nothing has handed the turn back and the reply is yours. `stop_reason` alone will
- * not do — it is `end_turn` on a main thread's last message and empty on some others — so what
- * the message *called* is the half worth testing.
- *
- * Only threads that could plausibly be running pay for this, so it costs one small read each.
+ * How far back to look when the tail above holds no timestamped record at all. `readTail` drops the
+ * partial line its window starts in, so a last record bigger than the window — a screenshot, a long
+ * tool result — or a batch of bookkeeping bigger than it leaves nothing to date the thread by, and
+ * falling back to mtime is the very bug the tail exists to fix. The tail itself stays small because
+ * nearly every transcript is answered by it; only one that is not pays for this, once per change.
  */
-async function awaitingReply(file) {
-  let records
-  try {
-    records = jsonLines(await readTail(file, TAIL_BYTES))
-  } catch {
-    return false
-  }
-  for (let i = records.length - 1; i >= 0; i--) {
-    const r = records[i]
-    // A user turn, a tool result or an attachment all mean the model speaks next — whatever the
-    // process is doing, it is not waiting on anyone.
-    if (r.type === 'user') return false
-    if (r.type !== 'assistant') continue
-    const content = r.message?.content
-    const calling = Array.isArray(content) && content.some((c) => c?.type === 'tool_use')
-    return !calling && r.message?.stop_reason !== 'tool_use'
-  }
-  return false
-}
+const WIDE_TAIL_BYTES = 2 * 1024 * 1024
 
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
 const metaCache = new Map()
@@ -239,8 +282,140 @@ async function transcriptMeta(entry) {
   } catch {
     meta = readTranscriptMeta([])
   }
+  // No cwd in a head shorter than the file is a head that ran out before the transcript said
+  // where it was — not a transcript that never says.
+  if (!meta.cwd && entry.size > HEAD_BYTES) meta = await openingMeta(entry)
   metaCache.set(entry.id, { mtime: entry.mtime, meta })
   return meta
+}
+
+/**
+ * Metadata for a transcript whose first cwd lies past the head, read forward until it appears.
+ *
+ * `readHead` has to drop a trailing partial line, and a first record longer than the whole head
+ * leaves it nothing at all — so the cwd, the start time and the first prompt went missing together,
+ * and the thread fell through to guessing its folder from the folder's name.
+ *
+ * Everything up to the first cwd is written once and never changes, so once found it is kept
+ * against the session alone. Keyed on mtime like the head, a live transcript with a giant first
+ * record would re-read half a megabyte on every poll it moved.
+ */
+const openingCache = new Map()
+async function openingMeta(entry) {
+  const known = openingCache.get(entry.id)
+  if (known) return known
+  let meta
+  try {
+    meta = readTranscriptMeta(
+      await readRecordsUntil(entry.file, { maxBytes: OPENING_BYTES, until: (r) => Boolean(r.cwd) })
+    )
+  } catch {
+    meta = readTranscriptMeta([])
+  }
+  if (meta.cwd) openingCache.set(entry.id, meta)
+  return meta
+}
+
+/**
+ * What only the end of a transcript knows: when it last really did something, where it works
+ * now, and what it is called now.
+ *
+ * "When it last did something" is its last *timestamped* record, not the file's mtime. The app
+ * appends untimestamped bookkeeping — titles, modes, bridge and artifact records — to transcripts
+ * in bulk, days or months after a conversation ended, and a colony reading mtime woke every one of
+ * those threads from its three-day sleep at once.
+ *
+ * Later records win throughout: a thread renamed twice is called what it was renamed to last, and
+ * a session that moved into a worktree is on the worktree's branch now, not the one it began on.
+ */
+function readTranscriptTail(records) {
+  const tail = {
+    lastRecordAt: 0, relocatedCwd: '', cwd: '', gitBranch: '', customTitle: '', aiTitle: '',
+    endsInSession: '', handedBack: false, handedBackAt: 0,
+  }
+  let turn = null
+  for (const r of records) {
+    const t = r.timestamp ? Date.parse(r.timestamp) : NaN
+    if (!Number.isNaN(t) && t > tail.lastRecordAt) tail.lastRecordAt = t
+    if (typeof r.relocatedCwd === 'string' && r.relocatedCwd) tail.relocatedCwd = r.relocatedCwd
+    if (typeof r.cwd === 'string' && r.cwd) tail.cwd = r.cwd
+    if (r.gitBranch && r.gitBranch !== 'HEAD') tail.gitBranch = r.gitBranch
+    if (r.customTitle) tail.customTitle = r.customTitle
+    if (r.aiTitle) tail.aiTitle = r.aiTitle
+    if (r.type === 'user' || r.type === 'assistant') {
+      turn = r
+      // Whose conversation the file ends in. A copy keeps the session ids of the records it copied.
+      if (typeof r.sessionId === 'string') tail.endsInSession = r.sessionId
+    }
+  }
+  /*
+   * Whose turn it is. A live process is not work in progress: the CLI holds its process open while
+   * it sits at the prompt, so "the pid exists and the file moved recently" marks a thread that
+   * finished four minutes ago and asked you a question as *working*.
+   *
+   * The last user or assistant record says which. A user record — a prompt or a tool result — means
+   * the model speaks next. An assistant message that called a tool is mid-turn; one that called
+   * nothing has handed the turn back, and the reply is yours. `stop_reason` alone will not do — it is
+   * `end_turn` on a main thread's last message and empty on some others — so what the message
+   * *called* is the half worth testing. Bookkeeping written after a turn ends (hook attachments,
+   * titles) says nothing either way, which is why only those two types count.
+   */
+  if (turn?.type === 'assistant') {
+    const content = turn.message?.content
+    const calling = Array.isArray(content) && content.some((c) => c?.type === 'tool_use')
+    if (!calling && turn.message?.stop_reason !== 'tool_use') {
+      tail.handedBack = true
+      tail.handedBackAt = Date.parse(turn.timestamp) || 0
+    }
+  }
+  return tail
+}
+
+/** The tail, like the head, is kept until the file changes. */
+const tailCache = new Map()
+async function transcriptTail(entry) {
+  const cached = tailCache.get(entry.id)
+  if (cached && cached.mtime === entry.mtime) return cached.tail
+  let tail
+  try {
+    tail = readTranscriptTail(jsonLines(await readTail(entry.file, TAIL_BYTES)))
+    // No timestamp in a tail shorter than the file is a window that ran out inside one big record,
+    // not a transcript with nothing to date it by. Once, wider, and bounded — then whatever it says.
+    if (!tail.lastRecordAt && entry.size > TAIL_BYTES) {
+      tail = readTranscriptTail(jsonLines(await readTail(entry.file, WIDE_TAIL_BYTES)))
+    }
+  } catch {
+    tail = readTranscriptTail([])
+  }
+  tailCache.set(entry.id, { mtime: entry.mtime, tail })
+  return tail
+}
+
+/** When a transcript last did something: its last timestamped record, or its mtime if it has none. */
+const activityOf = (entry, tail) => tail.lastRecordAt || entry.mtime
+
+/** The CLI's own title precedence — custom, then AI, then summary, then first prompt — latest first. */
+const titleOf = (meta, tail) =>
+  tail?.customTitle || meta?.customTitle || tail?.aiTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || ''
+
+/**
+ * Where a terminal thread works. Its transcript's folder is named after the cwd it lives in *now*
+ * — a session that moves into a worktree has its transcript moved with it — so whichever cwd it
+ * reported that encodes to that name wins over the one it happened to start in.
+ *
+ * The tail's own latest cwd is a candidate as well as the record of the move. That record is written
+ * once, and a session that goes on working pushes it out of the tail within a few file reads; every
+ * record after it carries the new cwd, though. Asking the move alone sent such a thread back to the
+ * repo root it began in, and resuming it ran there — where its transcript is not.
+ *
+ * When none of them encodes to it, the folder is resolved before the opening cwd is fallen back on:
+ * that one has just been shown not to be where the transcript lives.
+ */
+function whereItRuns(dirName, meta, tail, known) {
+  for (const cwd of [tail.relocatedCwd, tail.cwd, meta.cwd]) {
+    if (cwd && encodeProjectDir(cwd) === dirName) return cwd
+  }
+  return resolveProjectDir(dirName, known) || meta.cwd || tail.cwd
 }
 
 /**
@@ -260,11 +435,38 @@ async function scanLiveSessions() {
     try {
       process.kill(record.pid, 0) // signal 0 only tests for existence
       live.add(record.sessionId)
-    } catch {
-      /* process is gone */
+    } catch (err) {
+      // EPERM is a process that exists but is not ours to signal — alive. Only ESRCH means gone. A
+      // pid recycled by somebody else's process reads as alive too, which is why being live is never
+      // enough to count as working: the transcript has to have moved as well.
+      if (err.code === 'EPERM') live.add(record.sessionId)
     }
   }
   return live
+}
+
+/** The newest write anywhere under a session's subagent folder, `<project>/<session>/subagents/**`. */
+async function newestSubagentWrite(transcriptFile, sessionId) {
+  let entries
+  try {
+    entries = await fsp.readdir(path.join(path.dirname(transcriptFile), sessionId, 'subagents'), {
+      recursive: true,
+      withFileTypes: true,
+    })
+  } catch {
+    return 0
+  }
+  let newest = 0
+  for (const e of entries) {
+    if (!e.isFile()) continue
+    try {
+      const { mtimeMs } = await fsp.stat(path.join(e.parentPath, e.name))
+      if (mtimeMs > newest) newest = mtimeMs
+    } catch {
+      /* written and gone between the listing and the stat */
+    }
+  }
+  return newest
 }
 
 /** Every thread the desktop app has a record for. */
@@ -309,8 +511,11 @@ function mergeThread(existing, next) {
     createdAt: Math.min(existing.createdAt || Infinity, next.createdAt || Infinity) || 0,
     lastActivityAt: Math.max(existing.lastActivityAt || 0, next.lastActivityAt || 0),
     lastFocusedAt: Math.max(existing.lastFocusedAt || 0, next.lastFocusedAt || 0),
+    hasFocusStamp: existing.hasFocusStamp || next.hasFocusStamp,
     hasError: existing.hasError || next.hasError,
     hasLiveProcess: existing.hasLiveProcess || next.hasLiveProcess,
+    handedBack: existing.handedBack || next.handedBack,
+    handedBackAt: Math.max(existing.handedBackAt || 0, next.handedBackAt || 0),
     starred: existing.starred || next.starred,
     routine: existing.routine || next.routine,
     prState: existing.prState || next.prState,
@@ -328,7 +533,7 @@ function mergeThread(existing, next) {
 function toThread(t) {
   const {
     desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId,
-    titled, hasLiveProcess, transcriptFile, recordActivityAt, ...rest
+    titled, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, handedBack, handedBackAt, ...rest
   } = t
   return {
     ...rest,
@@ -337,6 +542,35 @@ function toThread(t) {
     // session ran in — the worktree, not the repo root.
     ref: { desktopSessionId, desktopSessionIds, cliSessionId, cwd: t.cwd || '' },
   }
+}
+
+/**
+ * The thread a terminal-only transcript is really a copy of, or `''`.
+ *
+ * Importing or forking in the desktop app writes a fresh transcript under a new session id and
+ * leaves the source file behind, and nothing links the two. Left alone each becomes an astronaut:
+ * the same conversation, twice, on the same plot. Two shapes are folded, both conservatively:
+ *
+ *   - **A copy.** Its conversation ends in another session's records — the ids came along with the
+ *     history — and that session's transcript is on disk. It is that thread.
+ *   - **A superseded original.** It began the conversation a desktop thread was opened on, at the
+ *     moment that thread was created, and wrote nothing after that thread's own transcript last did.
+ *     Whatever it holds beyond the copy is a turn somebody rewound, not a thread anybody is working in.
+ *
+ * "Last did" is the owner transcript's last timestamped record, never the desktop record's stamps.
+ * Those fall back to when you last looked at the thread, and measured against that, merely opening
+ * it was enough to hide a genuine continuation.
+ *
+ * A transcript that did anything after its would-be owner is a continuation, and stays.
+ */
+function supersededBy(id, entry, meta, tail, transcripts, rootOwners) {
+  const other = tail.endsInSession
+  if (other && other !== id && transcripts.has(other)) return ID(other)
+  for (const owner of rootOwners.get(meta.rootUuid) || []) {
+    const sameMoment = Math.abs(owner.createdAt - meta.startedAt) <= SAME_MOMENT_MS
+    if (sameMoment && activityOf(entry, tail) <= owner.activeAt) return owner.id
+  }
+  return ''
 }
 
 async function scanThreads() {
@@ -352,6 +586,20 @@ async function scanThreads() {
   }
   const claimed = new Set()
 
+  /**
+   * Every path this machine has reported, keyed by the name the CLI would give its transcript
+   * folder — what a transcript that never states its own cwd is resolved against. First report
+   * wins, so two paths that happen to encode alike cannot trade places between polls.
+   */
+  const known = new Map()
+  const learn = (p) => {
+    if (typeof p !== 'string' || !p) return
+    const name = encodeProjectDir(p)
+    if (!known.has(name)) known.set(name, p)
+  }
+  /** Which desktop thread began each conversation — the one the app opened on it, never a fork. */
+  const rootOwners = new Map()
+
   for (const s of desktop) {
     const cliSessionId = s.cliSessionId || ''
     const entry = cliSessionId ? transcripts.get(cliSessionId) : null
@@ -360,6 +608,30 @@ async function scanThreads() {
     const cwd = s.cwd || s.originCwd || ''
     const { projectPath, project, worktree } = projectOf(cwd, s.originCwd)
     const meta = entry ? await transcriptMeta(entry) : null
+    const tail = entry ? await transcriptTail(entry) : null
+    learn(s.cwd)
+    learn(s.originCwd)
+    learn(meta?.cwd)
+    learn(tail?.relocatedCwd)
+    learn(tail?.cwd)
+
+    // The desktop record's own stamp lags: the app writes it when the thread is focused, so a
+    // session running in a terminal — or in a window you are not looking at — reads as hours
+    // old while its transcript is being written to right now. The later of the two is true.
+    const lastActivityAt = Math.max(
+      num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
+      entry ? activityOf(entry, tail) : 0
+    )
+    if (meta?.rootUuid && !s.forkedFromSessionId) {
+      const owners = rootOwners.get(meta.rootUuid) || []
+      // Its transcript's own last record, not the display stamp above: with no `lastActivityAt` that
+      // falls back to when you last looked, and opening a thread must not raise the bar a continuation
+      // has to clear. A root uuid came from a transcript, so there is always an entry to ask.
+      owners.push({
+        id: ID(cliSessionId || s.sessionId), createdAt: num(s.createdAt), activeAt: activityOf(entry, tail),
+      })
+      rootOwners.set(meta.rootUuid, owners)
+    }
 
     add({
       id: ID(cliSessionId || s.sessionId),
@@ -368,29 +640,26 @@ async function scanThreads() {
       desktopSessionIds: s.sessionId ? [s.sessionId] : [],
       titled: Boolean(s.title),
       bridgeSessionId: (s.bridgeSessionIds && s.bridgeSessionIds[0]) || '',
-      title: s.title || meta?.customTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || 'Untitled thread',
+      title: s.title || titleOf(meta, tail) || 'Untitled thread',
       preview: meta?.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
       project,
       projectPath,
       worktree,
       cwd,
-      gitBranch: meta?.gitBranch || '',
+      gitBranch: tail?.gitBranch || meta?.gitBranch || '',
       model: s.model || '',
       effort: s.effort || '',
       createdAt: num(s.createdAt) || meta?.startedAt || 0,
-      // The desktop record's own stamp lags: the app writes it when the thread is focused, so a
-      // session running in a terminal — or in a window you are not looking at — reads as hours
-      // old while its transcript is being written to right now. The later of the two is true.
-      lastActivityAt: Math.max(
-        num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
-        entry?.mtime || 0
-      ),
+      lastActivityAt,
       // Kept apart from the above. "Unread" compares against when you last *looked*, and both
       // sides have to come from the app's own bookkeeping: measure a transcript mtime against
       // `lastFocusedAt` instead and every background write puts a `?` over half the colony.
       recordActivityAt: num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
       lastFocusedAt: num(s.lastFocusedAt),
+      hasFocusStamp: 'lastFocusedAt' in s,
       hasLiveProcess: live.has(cliSessionId),
+      handedBack: tail?.handedBack || false,
+      handedBackAt: tail?.handedBackAt || 0,
       hasError: Boolean(s.error),
       starred: s.isStarred === true,
       routine: s.scheduledTaskId || '',
@@ -404,31 +673,46 @@ async function scanThreads() {
   }
 
   // Transcripts with no desktop record — usually threads started straight from the terminal.
+  // All of them are read first (cached, so free after the first poll), so that every path they
+  // report is known before any one of them needs a folder resolved.
+  const loose = []
   for (const [id, entry] of transcripts) {
     if (claimed.has(id)) continue
     const meta = await transcriptMeta(entry)
-    const cwd = meta.cwd || decodeProjectDir(path.basename(entry.projectDir))
+    const tail = await transcriptTail(entry)
+    learn(meta.cwd)
+    learn(tail.relocatedCwd)
+    learn(tail.cwd)
+    loose.push({ id, entry, meta, tail })
+  }
+
+  for (const { id, entry, meta, tail } of loose) {
+    if (supersededBy(id, entry, meta, tail, transcripts, rootOwners)) continue
+    const cwd = whereItRuns(path.basename(entry.projectDir), meta, tail, known)
     const { projectPath, project, worktree } = projectOf(cwd, '')
     add({
       id: ID(id),
       cliSessionId: id,
       desktopSessionId: '',
       desktopSessionIds: [],
-      titled: Boolean(meta.customTitle || meta.aiTitle),
+      titled: Boolean(tail.customTitle || meta.customTitle || tail.aiTitle || meta.aiTitle),
       bridgeSessionId: '',
-      title: meta.customTitle || meta.aiTitle || meta.summary || meta.firstPrompt || 'Untitled thread',
+      title: titleOf(meta, tail) || 'Untitled thread',
       preview: meta.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
       project,
       projectPath,
       worktree,
       cwd,
-      gitBranch: meta.gitBranch,
+      gitBranch: tail.gitBranch || meta.gitBranch,
       model: '',
       effort: '',
       createdAt: meta.startedAt || entry.mtime,
-      lastActivityAt: entry.mtime,
+      lastActivityAt: activityOf(entry, tail),
       lastFocusedAt: 0,
+      hasFocusStamp: false,
       hasLiveProcess: live.has(id),
+      handedBack: tail.handedBack,
+      handedBackAt: tail.handedBackAt,
       hasError: false,
       starred: false,
       routine: '',
@@ -464,18 +748,30 @@ async function scanThreads() {
       now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS
   )
 
-  // Unread = the thread moved on after you last looked at it; never opened counts as unread.
-  // Terminal-only threads have no focus history at all, so "unread" is unknowable — not true.
+  // Unread = the thread moved on after you last looked at it; a recent thread never opened counts
+  // as unread. Terminal-only threads have no focus history at all, so "unread" is unknowable — not
+  // true.
   for (const thread of threads) {
     const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
-    thread.unread = thread.desktopSessionIds.length > 0 && seenAt > thread.lastFocusedAt
-    const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
-    const waiting =
-      thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
-    thread.running = thread.hasLiveProcess && fresh && !waiting
+    const moved = thread.hasFocusStamp ? seenAt > thread.lastFocusedAt : now - seenAt < NEVER_FOCUSED_MS
+    thread.unread = thread.desktopSessionIds.length > 0 && moved
+    const subagentAt =
+      thread.hasLiveProcess && thread.transcriptFile
+        ? await newestSubagentWrite(thread.transcriptFile, thread.cliSessionId)
+        : 0
+    const fresh = now - Math.max(thread.lastActivityAt, subagentAt) < ACTIVE_WINDOW_MS
+    // Only agent writes after the hand-back are work still going on. A foreground agent writes beside
+    // the transcript as well, and the turn that ran one answers seconds after its last write: counted,
+    // that write read a thread waiting on you as working — `?` hidden — for the rest of the window. A
+    // thread mid-turn has handed nothing back (`handedBackAt` is 0), so every write still counts there.
+    const background = subagentAt > thread.handedBackAt && now - subagentAt < BACKGROUND_WINDOW_MS
+    const waiting = thread.hasLiveProcess && fresh && thread.handedBack
+    thread.running = thread.hasLiveProcess && (background || (fresh && !waiting))
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
-    // it — the only way a terminal-only thread can ask for anything at all.
-    if (waiting) thread.unread = true
+    // it — the only way a terminal-only thread can ask for anything at all. Unless you have looked
+    // at it since: the desktop app records that, and looking is the answer to "is it waiting?".
+    const lookedSince = thread.handedBackAt > 0 && thread.lastFocusedAt >= thread.handedBackAt
+    if (waiting && !lookedSince) thread.unread = true
   }
   return threads.map(toThread)
 }
@@ -521,7 +817,9 @@ async function openThread(ref) {
  * written: the desktop app just opens an empty session with that folder as its workspace.
  */
 async function newSession(dir) {
-  const url = `claude://code/new?${new URLSearchParams({ folder: dir })}`
+  // encodeURIComponent, not URLSearchParams: the quick action sends `%20`, and `+` only means a
+  // space to a form parser — a handler that decodes with decodeURIComponent reads a literal plus.
+  const url = `claude://code/new?folder=${encodeURIComponent(dir)}`
   let command
   if (process.platform === 'linux') {
     const bin = await cliBinary()

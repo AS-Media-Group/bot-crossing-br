@@ -9,11 +9,12 @@ import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 import { HARNESSES } from '../server/harnesses/index.mjs'
 import codex from '../server/harnesses/codex.mjs'
 import claudeCode from '../server/harnesses/claude-code.mjs'
-import { readTail, findExecutable } from '../server/lib/fsutil.mjs'
+import { readHead, readRecordsUntil, readTail, findExecutable } from '../server/lib/fsutil.mjs'
 import { schemeOf, openInTerminal } from '../server/lib/xdg.mjs'
 
 // ── the contract ──────────────────────────────────────────────────────────────
@@ -157,6 +158,34 @@ test('readTail drops the partial line it lands in the middle of', async () => {
   assert.equal(await readTail(f, 1000), 'first line\nsecond line\nthird line\n')
 })
 
+test('readRecordsUntil reassembles a record bigger than any one read, and stops where asked', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  // 150k two-byte characters: 300KB of UTF-8 behind an odd-length prefix, so characters straddle reads.
+  const huge = { type: 'queue-operation', content: 'é'.repeat(150 * 1024) }
+  const lines = [huge, { type: 'user', cwd: '/tmp/demo' }, { type: 'after' }]
+  await fsp.writeFile(f, lines.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  // What the head reader makes of it: one line longer than the window is no lines at all.
+  assert.equal(await readHead(f, 192 * 1024), '')
+  const records = await readRecordsUntil(f, { maxBytes: 2 * 1024 * 1024, until: (r) => Boolean(r.cwd) })
+  assert.equal(records.length, 2, 'stops at the first record that satisfies until()')
+  assert.equal(records[0].content, huge.content, 'a character split across two reads comes back intact')
+  assert.equal(records[1].cwd, '/tmp/demo')
+})
+
+test('readRecordsUntil gives up at its byte budget rather than reading the whole file', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  const lines = [{ content: 'x'.repeat(300 * 1024) }, { cwd: '/tmp/demo' }]
+  await fsp.writeFile(f, lines.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  assert.deepEqual(await readRecordsUntil(f, { maxBytes: 100 * 1024, until: (r) => Boolean(r.cwd) }), [])
+})
+
+test('readRecordsUntil reads a last line that has no newline after it', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  await fsp.writeFile(f, JSON.stringify({ a: 1 }) + '\n' + JSON.stringify({ cwd: '/x' }))
+  const records = await readRecordsUntil(f, { maxBytes: 1024, until: (r) => Boolean(r.cwd) })
+  assert.deepEqual(records, [{ a: 1 }, { cwd: '/x' }])
+})
+
 test('findExecutable refuses junk, and refuses a directory that sits on PATH', async () => {
   assert.equal(await findExecutable(''), null)
   assert.equal(await findExecutable(null), null)
@@ -240,4 +269,457 @@ test('Cursor offers a folder link but never a per-thread one it cannot honour', 
   assert.ok(opened.url.includes('%20'), 'a space in the path is escaped, not left raw')
   assert.equal(h.newSession('relative/path').ok, false)
   await fsp.rm(home, { recursive: true, force: true })
+})
+
+// ── Claude Code, faked on disk ────────────────────────────────────────────────
+
+const MINUTE = 60 * 1000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+const ago = (ms) => new Date(Date.now() - ms).toISOString()
+
+/**
+ * The adapter works out every path it reads from the home directory once, at import. So a fixture
+ * home is put in place for exactly one fresh, cache-busted import and then taken away again — by
+ * the time the import resolves, the paths are constants. Every variable any platform consults for
+ * "home" or "app data" is swapped, or a Windows or Linux run would quietly read the real machine.
+ */
+const HOME_VARS = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME']
+
+async function fakeClaude() {
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-fixture-'))
+  const saved = Object.fromEntries(HOME_VARS.map((k) => [k, process.env[k]]))
+  Object.assign(process.env, {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: path.join(home, 'AppData', 'Roaming'),
+    LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+  })
+  try {
+    const h = (await import(`../server/harnesses/claude-code.mjs?${home}`)).default
+    return { h, cleanup: () => fsp.rm(home, { recursive: true, force: true }) }
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
+/** A transcript where the CLI would put it: under a folder named after its cwd, encoded. */
+async function writeTranscript(h, cwd, id, records) {
+  const folder = path.join(h.paths.CLI_PROJECTS, cwd.replace(/[^a-zA-Z0-9]/g, '-'))
+  await fsp.mkdir(folder, { recursive: true })
+  const file = path.join(folder, `${id}.jsonl`)
+  await fsp.writeFile(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  return file
+}
+
+/** One desktop-app session record: `claude-code-sessions/<account>/<org>/local_*.json`. */
+async function writeDesktopRecord(h, record) {
+  const org = path.join(h.paths.DESKTOP_SESSIONS, 'account', 'org')
+  await fsp.mkdir(org, { recursive: true })
+  await fsp.writeFile(path.join(org, `${record.sessionId}.json`), JSON.stringify(record))
+}
+
+/** A live-process registry entry, for a pid that is — by default — this very test process. */
+async function markLive(h, sessionId, pid = process.pid) {
+  await fsp.mkdir(h.paths.CLI_LIVE, { recursive: true })
+  await fsp.writeFile(path.join(h.paths.CLI_LIVE, `${sessionId}.json`), JSON.stringify({ pid, sessionId }))
+}
+
+const userSays = (text, fields) => ({
+  type: 'user', uuid: randomUUID(), parentUuid: null, message: { role: 'user', content: text }, ...fields,
+})
+const answers = (fields, content = [{ type: 'text', text: 'done' }]) => ({
+  type: 'assistant', uuid: randomUUID(), message: { role: 'assistant', content, stop_reason: 'end_turn' }, ...fields,
+})
+const desktopId = () => `local_${randomUUID()}`
+
+// A space, a trailing space and a hyphen: everything the folder-name encoding flattens.
+const REPO = '/Volumes/Work Drive /Clients/my-repo'
+
+test('a transcript whose first record outgrows the head still lands in its own repo and worktree', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = `${REPO}/.claude/worktrees/phase-2`
+    const id = randomUUID()
+    // The shape an SDK session handed a whole document takes: the prompt, twice, before any cwd.
+    const prompt = 'p'.repeat(200 * 1024)
+    await writeTranscript(h, cwd, id, [
+      { type: 'queue-operation', operation: 'enqueue', timestamp: ago(2 * MINUTE), sessionId: id, content: prompt },
+      userSays(prompt, { sessionId: id, cwd, timestamp: ago(2 * MINUTE) }),
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.project, 'my-repo')
+    assert.equal(t.projectPath, REPO)
+    assert.equal(t.worktree, 'phase-2')
+    assert.equal(t.cwd, cwd)
+    assert.ok(t.title.length <= 300, `a pasted prompt makes a title, not a ${t.title.length}-character one`)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a transcript that never names its cwd borrows one that encodes to its folder, and never guesses', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const sibling = randomUUID()
+    await writeTranscript(h, REPO, sibling, [userSays('hi', { sessionId: sibling, cwd: REPO, timestamp: ago(HOUR) })])
+    // No record in either of these carries a cwd at all.
+    const orphan = randomUUID()
+    await writeTranscript(h, `${REPO}/.claude/worktrees/wt-a`, orphan, [{ type: 'summary', summary: 'lost one' }])
+    const stray = randomUUID()
+    await writeTranscript(h, '/nowhere/at-all', stray, [{ type: 'summary', summary: 'stray' }])
+
+    const byId = Object.fromEntries((await h.scanThreads()).map((t) => [t.id, t]))
+    const o = byId[`claude-code:${orphan}`]
+    assert.equal(o.project, 'my-repo')
+    assert.equal(o.projectPath, REPO)
+    assert.equal(o.worktree, 'wt-a')
+    assert.equal(byId[`claude-code:${stray}`].projectPath, '', 'no folder is better than a made-up one')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a thread is as recent as its last timestamped record, not a metadata write months later', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const spoke = ago(10 * DAY)
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('hello', { sessionId: id, cwd, timestamp: spoke }),
+      answers({ sessionId: id, cwd, timestamp: spoke }),
+      // What the desktop app appends long afterwards, with no timestamp of its own.
+      { type: 'custom-title', customTitle: 'renamed later', sessionId: id },
+      { type: 'mode', mode: 'default', sessionId: id },
+    ])
+    const now = new Date()
+    await fsp.utimes(file, now, now)
+    const [t] = await h.scanThreads()
+    assert.equal(t.lastActivityAt, Date.parse(spoke))
+    assert.equal(t.title, 'renamed later')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a last record bigger than the tail still dates the thread, not the metadata after it', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const spoke = ago(10 * DAY)
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('take a screenshot', { sessionId: id, cwd, timestamp: spoke }),
+      // A screenshot or a long tool result: one record longer than the whole 64 KiB tail.
+      answers({ sessionId: id, cwd, timestamp: spoke }, [{ type: 'text', text: 'x'.repeat(80 * 1024) }]),
+      { type: 'custom-title', customTitle: 'renamed later', sessionId: id },
+      { type: 'mode', mode: 'default', sessionId: id },
+    ])
+    const now = new Date()
+    await fsp.utimes(file, now, now)
+    const [t] = await h.scanThreads()
+    assert.equal(t.lastActivityAt, Date.parse(spoke), 'no timestamp in the window is not "dated by mtime"')
+    assert.equal(t.title, 'renamed later')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a session that moved into a worktree reports the worktree, and the branch it is on now', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const wt = `${REPO}/.claude/worktrees/feature-x`
+    const id = randomUUID()
+    // The transcript moves with the session, so it lives in the worktree's folder.
+    await writeTranscript(h, wt, id, [
+      userSays('start', { sessionId: id, cwd: REPO, gitBranch: 'main', timestamp: ago(HOUR) }),
+      { type: 'relocated', sessionId: id, relocatedCwd: wt },
+      userSays('carry on', { sessionId: id, cwd: wt, gitBranch: 'worktree-feature-x', timestamp: ago(50 * MINUTE) }),
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.cwd, wt)
+    assert.equal(t.worktree, 'feature-x')
+    assert.equal(t.project, 'my-repo')
+    assert.equal(t.gitBranch, 'worktree-feature-x')
+    assert.equal(t.ref.cwd, wt, 'resuming has to happen where the session is, not where it began')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a session stays in its worktree after the move has scrolled out of the tail', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const wt = `${REPO}/.claude/worktrees/feature-x`
+    const id = randomUUID()
+    const there = { sessionId: id, cwd: wt, gitBranch: 'worktree-feature-x' }
+    // The move is written once. A few big tool results after it and it is no longer in the last 64 KiB.
+    const big = [{ type: 'text', text: 'x'.repeat(20 * 1024) }]
+    const work = [1, 2, 3, 4, 5].map((n) => answers({ ...there, timestamp: ago((50 - n) * MINUTE) }, big))
+    await writeTranscript(h, wt, id, [
+      userSays('start', { sessionId: id, cwd: REPO, gitBranch: 'main', timestamp: ago(HOUR) }),
+      { type: 'relocated', sessionId: id, relocatedCwd: wt },
+      userSays('carry on', { ...there, timestamp: ago(50 * MINUTE) }),
+      ...work,
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.cwd, wt)
+    assert.equal(t.worktree, 'feature-x')
+    assert.equal(t.ref.cwd, wt, 'resuming has to happen where the session is, not where it began')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a desktop record from before focus was tracked is not a thread that was never opened', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const old = Date.now() - 30 * DAY
+    const recent = Date.now() - MINUTE
+    // No `lastFocusedAt` key at all — the app did not write one back then.
+    await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/demo', title: 'old', createdAt: old, lastActivityAt: old })
+    await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/demo', title: 'new', createdAt: recent, lastActivityAt: recent })
+    // The key present, and the thread moved on after it: unread exactly as before.
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cwd: '/tmp/demo', title: 'moved on', createdAt: old, lastActivityAt: old + 1000, lastFocusedAt: old,
+    })
+    const byTitle = Object.fromEntries((await h.scanThreads()).map((t) => [t.title, t]))
+    assert.equal(byTitle.old.unread, false, 'months old, never stamped: unknowable, so not asking')
+    assert.equal(byTitle.new.unread, true, 'a new thread nobody has opened yet still asks')
+    assert.equal(byTitle['moved on'].unread, true)
+    assert.equal('hasFocusStamp' in byTitle.old, false, 'bookkeeping stays inside the adapter')
+  } finally {
+    await cleanup()
+  }
+})
+
+test("a copy of a thread's transcript is that thread, not a second astronaut", async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const sid = randomUUID()
+    const copy = randomUUID()
+    const convo = [
+      userSays('hello', { sessionId: sid, cwd, timestamp: ago(2 * HOUR) }),
+      answers({ sessionId: sid, cwd, timestamp: ago(2 * HOUR - MINUTE) }),
+    ]
+    await writeTranscript(h, cwd, sid, convo)
+    // A fork or import: the same records, the same session ids, and the app's own title on the end.
+    // Neither has a desktop record, so where the copy's conversation ends is all that can fold it.
+    await writeTranscript(h, cwd, copy, [
+      ...convo,
+      { type: 'custom-title', customTitle: 'copy', sessionId: copy },
+    ])
+    assert.deepEqual((await h.scanThreads()).map((t) => t.id), [`claude-code:${sid}`])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a copy whose original is no longer on disk stays a thread of its own', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const gone = randomUUID()
+    const copy = randomUUID()
+    // The conversation ends in another session's records, but that session's transcript was deleted:
+    // there is nothing to fold it into, and folding it anyway would lose the conversation outright.
+    await writeTranscript(h, cwd, copy, [
+      userSays('hello', { sessionId: gone, cwd, timestamp: ago(2 * HOUR) }),
+      answers({ sessionId: gone, cwd, timestamp: ago(2 * HOUR - MINUTE) }),
+      { type: 'custom-title', customTitle: 'copy', sessionId: copy },
+    ])
+    assert.deepEqual((await h.scanThreads()).map((t) => t.id), [`claude-code:${copy}`])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a transcript the desktop app superseded is folded, but one that carried on after it is not', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const began = Date.now() - 3 * HOUR
+    const root = randomUUID()
+    const original = randomUUID()
+    const current = randomUUID()
+    const diverged = randomUUID()
+    const opening = (sessionId) => userSays('start', { uuid: root, sessionId, cwd, timestamp: new Date(began).toISOString() })
+    // The file the thread began in, left behind when the app moved the conversation on.
+    await writeTranscript(h, cwd, original, [
+      opening(original),
+      answers({ sessionId: original, cwd, timestamp: new Date(began + MINUTE).toISOString() }),
+    ])
+    // The transcript the desktop record points at now: the same opening, then more.
+    await writeTranscript(h, cwd, current, [
+      opening(original),
+      userSays('more', { sessionId: current, cwd, parentUuid: root, timestamp: new Date(began + 10 * MINUTE).toISOString() }),
+      answers({ sessionId: current, cwd, timestamp: new Date(began + 11 * MINUTE).toISOString() }),
+    ])
+    // Same opening, but it did something after the thread's last activity: a continuation.
+    await writeTranscript(h, cwd, diverged, [
+      opening(diverged),
+      answers({ sessionId: diverged, cwd, timestamp: new Date(began + 20 * MINUTE).toISOString() }),
+    ])
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: current, cwd, title: 'the thread',
+      createdAt: began, lastActivityAt: began + 11 * MINUTE, lastFocusedAt: Date.now(),
+    })
+    const ids = (await h.scanThreads()).map((t) => t.id).sort()
+    assert.deepEqual(ids, [`claude-code:${current}`, `claude-code:${diverged}`].sort())
+  } finally {
+    await cleanup()
+  }
+})
+
+test('looking at a thread does not hide a transcript that carried on after it', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const began = Date.now() - 3 * HOUR
+    const at = (ms) => new Date(began + ms).toISOString()
+    const root = randomUUID()
+    const original = randomUUID()
+    const current = randomUUID()
+    const diverged = randomUUID()
+    const opening = (sessionId) => userSays('start', { uuid: root, sessionId, cwd, timestamp: at(0) })
+    await writeTranscript(h, cwd, original, [
+      opening(original),
+      answers({ sessionId: original, cwd, timestamp: at(MINUTE) }),
+    ])
+    // The thread's own transcript last wrote at +11 minutes…
+    await writeTranscript(h, cwd, current, [
+      opening(original),
+      userSays('more', { sessionId: current, cwd, parentUuid: root, timestamp: at(10 * MINUTE) }),
+      answers({ sessionId: current, cwd, timestamp: at(11 * MINUTE) }),
+    ])
+    // …and this one at +20: a continuation, however recently somebody looked at the thread.
+    await writeTranscript(h, cwd, diverged, [
+      opening(diverged),
+      answers({ sessionId: diverged, cwd, timestamp: at(20 * MINUTE) }),
+    ])
+    // No `lastActivityAt`: the only recent stamp the record has is when it was last looked at.
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: current, cwd, title: 'the thread',
+      createdAt: began, lastFocusedAt: Date.now(),
+    })
+    const ids = (await h.scanThreads()).map((t) => t.id).sort()
+    assert.deepEqual(ids, [`claude-code:${current}`, `claude-code:${diverged}`].sort())
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a live thread whose background agents are still writing is working, not waiting on you', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('run the audit', { sessionId: id, cwd, timestamp: ago(5 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(4 * MINUTE) }), // handed the turn back…
+    ])
+    await markLive(h, id)
+    // …while a workflow it started carries on beside the transcript.
+    const agentLog = path.join(path.dirname(file), id, 'subagents', 'workflows', 'wf_1', 'agent-a.jsonl')
+    await fsp.mkdir(path.dirname(agentLog), { recursive: true })
+    await fsp.writeFile(agentLog, '{}\n')
+
+    let [t] = await h.scanThreads()
+    assert.equal(t.running, true, 'the workflow it started is still going')
+
+    // The workflow finishes: its last write drifts out of the window, and the turn is yours again.
+    const finished = new Date(Date.now() - 3 * MINUTE)
+    await fsp.utimes(agentLog, finished, finished)
+    ;[t] = await h.scanThreads()
+    assert.equal(t.running, false)
+    assert.equal(t.unread, true)
+    assert.equal('handedBack' in t, false, 'bookkeeping stays inside the adapter')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a thread that ran an agent and then answered is waiting on you, not still working', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('look into it', { sessionId: id, cwd, timestamp: ago(3 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(30 * 1000) }), // handed the turn back 30 s ago
+    ])
+    await markLive(h, id)
+    // A foreground agent writes beside the transcript too, and its last write came before the answer.
+    const agentLog = path.join(path.dirname(file), id, 'subagents', 'agent-a.jsonl')
+    await fsp.mkdir(path.dirname(agentLog), { recursive: true })
+    await fsp.writeFile(agentLog, '{}\n')
+    const wrote = new Date(Date.now() - MINUTE)
+    await fsp.utimes(agentLog, wrote, wrote)
+
+    const [t] = await h.scanThreads()
+    assert.equal(t.running, false, 'the agent finished before the thread handed back')
+    assert.equal(t.unread, true)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a thread you looked at after it handed the turn back is not asking again', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    await writeTranscript(h, cwd, id, [
+      userSays('question', { sessionId: id, cwd, timestamp: ago(5 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(4 * MINUTE) }),
+    ])
+    await markLive(h, id)
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: id, cwd, title: 'answered here',
+      createdAt: Date.now() - 5 * MINUTE, lastActivityAt: Date.now() - 4 * MINUTE, lastFocusedAt: Date.now(),
+    })
+    const [t] = await h.scanThreads()
+    assert.equal(t.running, false)
+    assert.equal(t.unread, false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test(
+  'a live session whose process we may not signal still counts as live',
+  // pid 1 belongs to the system: signalling it from an ordinary user is EPERM, not ESRCH.
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 },
+  async () => {
+    const { h, cleanup } = await fakeClaude()
+    try {
+      const id = randomUUID()
+      const cwd = '/tmp/demo'
+      await writeTranscript(h, cwd, id, [
+        userSays('go', { sessionId: id, cwd, timestamp: ago(MINUTE) }),
+        answers({ sessionId: id, cwd, timestamp: ago(30 * 1000) }, [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }]),
+      ])
+      await markLive(h, id, 1)
+      const [t] = await h.scanThreads()
+      assert.equal(t.running, true, 'mid-turn, with a process that exists')
+    } finally {
+      await cleanup()
+    }
+  }
+)
+
+test("a new conversation's folder is %-encoded, the way the app's own Finder quick action sends it", async () => {
+  // URLSearchParams form-encodes a space as `+`, which a handler decoding with decodeURIComponent
+  // reads as a literal plus — a folder that does not exist. %20 reads the same under either parser.
+  const { url } = await claudeCode.newSession('/tmp/Claude code ')
+  assert.equal(url, 'claude://code/new?folder=%2Ftmp%2FClaude%20code%20')
+  assert.equal(new URL(url).searchParams.get('folder'), '/tmp/Claude code ')
+  assert.equal(decodeURIComponent(url.split('folder=')[1]), '/tmp/Claude code ')
+  assert.equal(codex.newSession('/tmp/some repo').url, 'codex://threads/new?path=%2Ftmp%2Fsome%20repo')
 })
