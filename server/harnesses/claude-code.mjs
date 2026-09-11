@@ -554,8 +554,12 @@ function toThread(t) {
  *   - **A copy.** Its conversation ends in another session's records — the ids came along with the
  *     history — and that session's transcript is on disk. It is that thread.
  *   - **A superseded original.** It began the conversation a desktop thread was opened on, at the
- *     moment that thread was created, and wrote nothing after that thread last did. Whatever it
- *     holds beyond the copy is a turn somebody rewound, not a thread anybody is working in.
+ *     moment that thread was created, and wrote nothing after that thread's own transcript last did.
+ *     Whatever it holds beyond the copy is a turn somebody rewound, not a thread anybody is working in.
+ *
+ * "Last did" is the owner transcript's last timestamped record, never the desktop record's stamps.
+ * Those fall back to when you last looked at the thread, and measured against that, merely opening
+ * it was enough to hide a genuine continuation.
  *
  * A transcript that did anything after its would-be owner is a continuation, and stays.
  */
@@ -564,7 +568,7 @@ function supersededBy(id, entry, meta, tail, transcripts, rootOwners) {
   if (other && other !== id && transcripts.has(other)) return ID(other)
   for (const owner of rootOwners.get(meta.rootUuid) || []) {
     const sameMoment = Math.abs(owner.createdAt - meta.startedAt) <= SAME_MOMENT_MS
-    if (sameMoment && activityOf(entry, tail) <= owner.lastActivityAt) return owner.id
+    if (sameMoment && activityOf(entry, tail) <= owner.activeAt) return owner.id
   }
   return ''
 }
@@ -620,7 +624,12 @@ async function scanThreads() {
     )
     if (meta?.rootUuid && !s.forkedFromSessionId) {
       const owners = rootOwners.get(meta.rootUuid) || []
-      owners.push({ id: ID(cliSessionId || s.sessionId), createdAt: num(s.createdAt), lastActivityAt })
+      // Its transcript's own last record, not the display stamp above: with no `lastActivityAt` that
+      // falls back to when you last looked, and opening a thread must not raise the bar a continuation
+      // has to clear. A root uuid came from a transcript, so there is always an entry to ask.
+      owners.push({
+        id: ID(cliSessionId || s.sessionId), createdAt: num(s.createdAt), activeAt: activityOf(entry, tail),
+      })
       rootOwners.set(meta.rootUuid, owners)
     }
 

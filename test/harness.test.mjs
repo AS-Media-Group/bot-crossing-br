@@ -498,7 +498,7 @@ test('a desktop record from before focus was tracked is not a thread that was ne
   }
 })
 
-test("a copy of a desktop thread's transcript is that thread, not a second astronaut", async () => {
+test("a copy of a thread's transcript is that thread, not a second astronaut", async () => {
   const { h, cleanup } = await fakeClaude()
   try {
     const cwd = '/tmp/demo'
@@ -510,12 +510,31 @@ test("a copy of a desktop thread's transcript is that thread, not a second astro
     ]
     await writeTranscript(h, cwd, sid, convo)
     // A fork or import: the same records, the same session ids, and the app's own title on the end.
-    await writeTranscript(h, cwd, copy, [...convo, { type: 'custom-title', customTitle: 'copy', sessionId: copy }])
-    await writeDesktopRecord(h, {
-      sessionId: desktopId(), cliSessionId: sid, cwd, title: 'the thread',
-      createdAt: Date.now() - 2 * HOUR, lastActivityAt: Date.now() - 2 * HOUR, lastFocusedAt: Date.now(),
-    })
+    // Neither has a desktop record, so where the copy's conversation ends is all that can fold it.
+    await writeTranscript(h, cwd, copy, [
+      ...convo,
+      { type: 'custom-title', customTitle: 'copy', sessionId: copy },
+    ])
     assert.deepEqual((await h.scanThreads()).map((t) => t.id), [`claude-code:${sid}`])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a copy whose original is no longer on disk stays a thread of its own', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const gone = randomUUID()
+    const copy = randomUUID()
+    // The conversation ends in another session's records, but that session's transcript was deleted:
+    // there is nothing to fold it into, and folding it anyway would lose the conversation outright.
+    await writeTranscript(h, cwd, copy, [
+      userSays('hello', { sessionId: gone, cwd, timestamp: ago(2 * HOUR) }),
+      answers({ sessionId: gone, cwd, timestamp: ago(2 * HOUR - MINUTE) }),
+      { type: 'custom-title', customTitle: 'copy', sessionId: copy },
+    ])
+    assert.deepEqual((await h.scanThreads()).map((t) => t.id), [`claude-code:${copy}`])
   } finally {
     await cleanup()
   }
@@ -550,6 +569,44 @@ test('a transcript the desktop app superseded is folded, but one that carried on
     await writeDesktopRecord(h, {
       sessionId: desktopId(), cliSessionId: current, cwd, title: 'the thread',
       createdAt: began, lastActivityAt: began + 11 * MINUTE, lastFocusedAt: Date.now(),
+    })
+    const ids = (await h.scanThreads()).map((t) => t.id).sort()
+    assert.deepEqual(ids, [`claude-code:${current}`, `claude-code:${diverged}`].sort())
+  } finally {
+    await cleanup()
+  }
+})
+
+test('looking at a thread does not hide a transcript that carried on after it', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const began = Date.now() - 3 * HOUR
+    const at = (ms) => new Date(began + ms).toISOString()
+    const root = randomUUID()
+    const original = randomUUID()
+    const current = randomUUID()
+    const diverged = randomUUID()
+    const opening = (sessionId) => userSays('start', { uuid: root, sessionId, cwd, timestamp: at(0) })
+    await writeTranscript(h, cwd, original, [
+      opening(original),
+      answers({ sessionId: original, cwd, timestamp: at(MINUTE) }),
+    ])
+    // The thread's own transcript last wrote at +11 minutes…
+    await writeTranscript(h, cwd, current, [
+      opening(original),
+      userSays('more', { sessionId: current, cwd, parentUuid: root, timestamp: at(10 * MINUTE) }),
+      answers({ sessionId: current, cwd, timestamp: at(11 * MINUTE) }),
+    ])
+    // …and this one at +20: a continuation, however recently somebody looked at the thread.
+    await writeTranscript(h, cwd, diverged, [
+      opening(diverged),
+      answers({ sessionId: diverged, cwd, timestamp: at(20 * MINUTE) }),
+    ])
+    // No `lastActivityAt`: the only recent stamp the record has is when it was last looked at.
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: current, cwd, title: 'the thread',
+      createdAt: began, lastFocusedAt: Date.now(),
     })
     const ids = (await h.scanThreads()).map((t) => t.id).sort()
     assert.deepEqual(ids, [`claude-code:${current}`, `claude-code:${diverged}`].sort())
