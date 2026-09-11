@@ -760,7 +760,11 @@ async function scanThreads() {
         ? await newestSubagentWrite(thread.transcriptFile, thread.cliSessionId)
         : 0
     const fresh = now - Math.max(thread.lastActivityAt, subagentAt) < ACTIVE_WINDOW_MS
-    const background = now - subagentAt < BACKGROUND_WINDOW_MS
+    // Only agent writes after the hand-back are work still going on. A foreground agent writes beside
+    // the transcript as well, and the turn that ran one answers seconds after its last write: counted,
+    // that write read a thread waiting on you as working — `?` hidden — for the rest of the window. A
+    // thread mid-turn has handed nothing back (`handedBackAt` is 0), so every write still counts there.
+    const background = subagentAt > thread.handedBackAt && now - subagentAt < BACKGROUND_WINDOW_MS
     const waiting = thread.hasLiveProcess && fresh && thread.handedBack
     thread.running = thread.hasLiveProcess && (background || (fresh && !waiting))
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen

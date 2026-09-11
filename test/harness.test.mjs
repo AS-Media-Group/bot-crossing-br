@@ -645,6 +645,31 @@ test('a live thread whose background agents are still writing is working, not wa
   }
 })
 
+test('a thread that ran an agent and then answered is waiting on you, not still working', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('look into it', { sessionId: id, cwd, timestamp: ago(3 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(30 * 1000) }), // handed the turn back 30 s ago
+    ])
+    await markLive(h, id)
+    // A foreground agent writes beside the transcript too, and its last write came before the answer.
+    const agentLog = path.join(path.dirname(file), id, 'subagents', 'agent-a.jsonl')
+    await fsp.mkdir(path.dirname(agentLog), { recursive: true })
+    await fsp.writeFile(agentLog, '{}\n')
+    const wrote = new Date(Date.now() - MINUTE)
+    await fsp.utimes(agentLog, wrote, wrote)
+
+    const [t] = await h.scanThreads()
+    assert.equal(t.running, false, 'the agent finished before the thread handed back')
+    assert.equal(t.unread, true)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('a thread you looked at after it handed the turn back is not asking again', async () => {
   const { h, cleanup } = await fakeClaude()
   try {
