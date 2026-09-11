@@ -510,3 +510,77 @@ test('a transcript the desktop app superseded is folded, but one that carried on
     await cleanup()
   }
 })
+
+test('a live thread whose background agents are still writing is working, not waiting on you', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('run the audit', { sessionId: id, cwd, timestamp: ago(5 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(4 * MINUTE) }), // handed the turn back…
+    ])
+    await markLive(h, id)
+    // …while a workflow it started carries on beside the transcript.
+    const agentLog = path.join(path.dirname(file), id, 'subagents', 'workflows', 'wf_1', 'agent-a.jsonl')
+    await fsp.mkdir(path.dirname(agentLog), { recursive: true })
+    await fsp.writeFile(agentLog, '{}\n')
+
+    let [t] = await h.scanThreads()
+    assert.equal(t.running, true, 'the workflow it started is still going')
+
+    // The workflow finishes: its last write drifts out of the window, and the turn is yours again.
+    const finished = new Date(Date.now() - 3 * MINUTE)
+    await fsp.utimes(agentLog, finished, finished)
+    ;[t] = await h.scanThreads()
+    assert.equal(t.running, false)
+    assert.equal(t.unread, true)
+    assert.equal('handedBack' in t, false, 'bookkeeping stays inside the adapter')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a thread you looked at after it handed the turn back is not asking again', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    await writeTranscript(h, cwd, id, [
+      userSays('question', { sessionId: id, cwd, timestamp: ago(5 * MINUTE) }),
+      answers({ sessionId: id, cwd, timestamp: ago(4 * MINUTE) }),
+    ])
+    await markLive(h, id)
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: id, cwd, title: 'answered here',
+      createdAt: Date.now() - 5 * MINUTE, lastActivityAt: Date.now() - 4 * MINUTE, lastFocusedAt: Date.now(),
+    })
+    const [t] = await h.scanThreads()
+    assert.equal(t.running, false)
+    assert.equal(t.unread, false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test(
+  'a live session whose process we may not signal still counts as live',
+  // pid 1 belongs to the system: signalling it from an ordinary user is EPERM, not ESRCH.
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 },
+  async () => {
+    const { h, cleanup } = await fakeClaude()
+    try {
+      const id = randomUUID()
+      const cwd = '/tmp/demo'
+      await writeTranscript(h, cwd, id, [
+        userSays('go', { sessionId: id, cwd, timestamp: ago(MINUTE) }),
+        answers({ sessionId: id, cwd, timestamp: ago(30 * 1000) }, [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }]),
+      ])
+      await markLive(h, id, 1)
+      const [t] = await h.scanThreads()
+      assert.equal(t.running, true, 'mid-turn, with a process that exists')
+    } finally {
+      await cleanup()
+    }
+  }
+)

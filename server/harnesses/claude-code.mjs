@@ -114,6 +114,13 @@ const NEVER_FOCUSED_MS = 3 * 24 * 60 * 60 * 1000
 const SAME_MOMENT_MS = 60 * 1000
 
 /**
+ * How recently a session's subagents must have written for the session to count as working. A
+ * thread that handed the turn back while a background agent or workflow it started carries on has a
+ * quiet transcript — and a busy folder beside it.
+ */
+const BACKGROUND_WINDOW_MS = 2 * 60 * 1000
+
+/**
  * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
  * across harnesses, and while two UUIDs will not collide, the colony keys its archive list and
  * saved layout on this string — so it is worth being unambiguous rather than merely lucky.
@@ -255,41 +262,6 @@ async function scanTranscripts() {
 /** How much of a transcript's end it takes to see whose turn it is. One record is plenty. */
 const TAIL_BYTES = 64 * 1024
 
-/**
- * Whether a transcript ends with the turn handed back to you.
- *
- * A live process is not the same thing as work in progress. The CLI holds its process open while
- * it sits at the prompt, so "the pid exists and the file moved recently" marks a thread that
- * finished four minutes ago and asked you a question as *working* — an astronaut hammering away
- * at a thread whose whole point is that it is waiting.
- *
- * The transcript says which it is. A last assistant message that called a tool is mid-turn; one
- * that called nothing has handed the turn back and the reply is yours. `stop_reason` alone will
- * not do — it is `end_turn` on a main thread's last message and empty on some others — so what
- * the message *called* is the half worth testing.
- *
- * Only threads that could plausibly be running pay for this, so it costs one small read each.
- */
-async function awaitingReply(file) {
-  let records
-  try {
-    records = jsonLines(await readTail(file, TAIL_BYTES))
-  } catch {
-    return false
-  }
-  for (let i = records.length - 1; i >= 0; i--) {
-    const r = records[i]
-    // A user turn, a tool result or an attachment all mean the model speaks next — whatever the
-    // process is doing, it is not waiting on anyone.
-    if (r.type === 'user') return false
-    if (r.type !== 'assistant') continue
-    const content = r.message?.content
-    const calling = Array.isArray(content) && content.some((c) => c?.type === 'tool_use')
-    return !calling && r.message?.stop_reason !== 'tool_use'
-  }
-  return false
-}
-
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
 const metaCache = new Map()
 async function transcriptMeta(entry) {
@@ -350,7 +322,9 @@ async function openingMeta(entry) {
 function readTranscriptTail(records) {
   const tail = {
     lastRecordAt: 0, relocatedCwd: '', gitBranch: '', customTitle: '', aiTitle: '', endsInSession: '',
+    handedBack: false, handedBackAt: 0,
   }
+  let turn = null
   for (const r of records) {
     const t = r.timestamp ? Date.parse(r.timestamp) : NaN
     if (!Number.isNaN(t) && t > tail.lastRecordAt) tail.lastRecordAt = t
@@ -358,9 +332,30 @@ function readTranscriptTail(records) {
     if (r.gitBranch && r.gitBranch !== 'HEAD') tail.gitBranch = r.gitBranch
     if (r.customTitle) tail.customTitle = r.customTitle
     if (r.aiTitle) tail.aiTitle = r.aiTitle
-    // Whose conversation the file ends in. A copy keeps the session ids of the records it copied.
-    if ((r.type === 'user' || r.type === 'assistant') && typeof r.sessionId === 'string') {
-      tail.endsInSession = r.sessionId
+    if (r.type === 'user' || r.type === 'assistant') {
+      turn = r
+      // Whose conversation the file ends in. A copy keeps the session ids of the records it copied.
+      if (typeof r.sessionId === 'string') tail.endsInSession = r.sessionId
+    }
+  }
+  /*
+   * Whose turn it is. A live process is not work in progress: the CLI holds its process open while
+   * it sits at the prompt, so "the pid exists and the file moved recently" marks a thread that
+   * finished four minutes ago and asked you a question as *working*.
+   *
+   * The last user or assistant record says which. A user record — a prompt or a tool result — means
+   * the model speaks next. An assistant message that called a tool is mid-turn; one that called
+   * nothing has handed the turn back, and the reply is yours. `stop_reason` alone will not do — it is
+   * `end_turn` on a main thread's last message and empty on some others — so what the message
+   * *called* is the half worth testing. Bookkeeping written after a turn ends (hook attachments,
+   * titles) says nothing either way, which is why only those two types count.
+   */
+  if (turn?.type === 'assistant') {
+    const content = turn.message?.content
+    const calling = Array.isArray(content) && content.some((c) => c?.type === 'tool_use')
+    if (!calling && turn.message?.stop_reason !== 'tool_use') {
+      tail.handedBack = true
+      tail.handedBackAt = Date.parse(turn.timestamp) || 0
     }
   }
   return tail
@@ -417,11 +412,38 @@ async function scanLiveSessions() {
     try {
       process.kill(record.pid, 0) // signal 0 only tests for existence
       live.add(record.sessionId)
-    } catch {
-      /* process is gone */
+    } catch (err) {
+      // EPERM is a process that exists but is not ours to signal — alive. Only ESRCH means gone. A
+      // pid recycled by somebody else's process reads as alive too, which is why being live is never
+      // enough to count as working: the transcript has to have moved as well.
+      if (err.code === 'EPERM') live.add(record.sessionId)
     }
   }
   return live
+}
+
+/** The newest write anywhere under a session's subagent folder, `<project>/<session>/subagents/**`. */
+async function newestSubagentWrite(transcriptFile, sessionId) {
+  let entries
+  try {
+    entries = await fsp.readdir(path.join(path.dirname(transcriptFile), sessionId, 'subagents'), {
+      recursive: true,
+      withFileTypes: true,
+    })
+  } catch {
+    return 0
+  }
+  let newest = 0
+  for (const e of entries) {
+    if (!e.isFile()) continue
+    try {
+      const { mtimeMs } = await fsp.stat(path.join(e.parentPath, e.name))
+      if (mtimeMs > newest) newest = mtimeMs
+    } catch {
+      /* written and gone between the listing and the stat */
+    }
+  }
+  return newest
 }
 
 /** Every thread the desktop app has a record for. */
@@ -469,6 +491,8 @@ function mergeThread(existing, next) {
     hasFocusStamp: existing.hasFocusStamp || next.hasFocusStamp,
     hasError: existing.hasError || next.hasError,
     hasLiveProcess: existing.hasLiveProcess || next.hasLiveProcess,
+    handedBack: existing.handedBack || next.handedBack,
+    handedBackAt: Math.max(existing.handedBackAt || 0, next.handedBackAt || 0),
     starred: existing.starred || next.starred,
     routine: existing.routine || next.routine,
     prState: existing.prState || next.prState,
@@ -486,7 +510,7 @@ function mergeThread(existing, next) {
 function toThread(t) {
   const {
     desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId,
-    titled, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, ...rest
+    titled, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, handedBack, handedBackAt, ...rest
   } = t
   return {
     ...rest,
@@ -601,6 +625,8 @@ async function scanThreads() {
       lastFocusedAt: num(s.lastFocusedAt),
       hasFocusStamp: 'lastFocusedAt' in s,
       hasLiveProcess: live.has(cliSessionId),
+      handedBack: tail?.handedBack || false,
+      handedBackAt: tail?.handedBackAt || 0,
       hasError: Boolean(s.error),
       starred: s.isStarred === true,
       routine: s.scheduledTaskId || '',
@@ -651,6 +677,8 @@ async function scanThreads() {
       lastFocusedAt: 0,
       hasFocusStamp: false,
       hasLiveProcess: live.has(id),
+      handedBack: tail.handedBack,
+      handedBackAt: tail.handedBackAt,
       hasError: false,
       starred: false,
       routine: '',
@@ -693,13 +721,19 @@ async function scanThreads() {
     const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
     const moved = thread.hasFocusStamp ? seenAt > thread.lastFocusedAt : now - seenAt < NEVER_FOCUSED_MS
     thread.unread = thread.desktopSessionIds.length > 0 && moved
-    const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
-    const waiting =
-      thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
-    thread.running = thread.hasLiveProcess && fresh && !waiting
+    const subagentAt =
+      thread.hasLiveProcess && thread.transcriptFile
+        ? await newestSubagentWrite(thread.transcriptFile, thread.cliSessionId)
+        : 0
+    const fresh = now - Math.max(thread.lastActivityAt, subagentAt) < ACTIVE_WINDOW_MS
+    const background = now - subagentAt < BACKGROUND_WINDOW_MS
+    const waiting = thread.hasLiveProcess && fresh && thread.handedBack
+    thread.running = thread.hasLiveProcess && (background || (fresh && !waiting))
     // A thread that handed the turn back wants you, whether or not the desktop app has ever seen
-    // it — the only way a terminal-only thread can ask for anything at all.
-    if (waiting) thread.unread = true
+    // it — the only way a terminal-only thread can ask for anything at all. Unless you have looked
+    // at it since: the desktop app records that, and looking is the answer to "is it waiting?".
+    const lookedSince = thread.handedBackAt > 0 && thread.lastFocusedAt >= thread.handedBackAt
+    if (waiting && !lookedSince) thread.unread = true
   }
   return threads.map(toThread)
 }
