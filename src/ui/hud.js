@@ -4,6 +4,7 @@ import { TIMES, systemTimeOfDay } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
+import { formatTokens, limitChip, resetLabel, zoneUsage } from '../game/usage-view.js'
 
 /**
  * The whole HUD, in plain DOM.
@@ -394,6 +395,12 @@ export class Hud {
       if (!this.visible) this.toggleUi(true)
       this.toggleSettings()
     })
+    // Same bargain as settings: the numbers live in the HUD, so the panels come back first.
+    onBar('#bar-usage', () => {
+      if (!this.visible) this.toggleUi(true)
+      this.toggleUsage()
+    })
+    on('#btn-close-usage', 'click', () => this.toggleUsage(false))
     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
@@ -411,6 +418,114 @@ export class Hud {
   syncSettings() {
     for (const c of this.controls) c.sync()
     this.$('.fps').classList.toggle('on', Boolean(this.settings.get('showFps')))
+  }
+
+  /**
+   * What Claude has spent: the chip in the bar, and the panel behind it.
+   *
+   * The four kinds of token are never added together. Cache reads run to billions against
+   * millions of output on a normal week, so one "tokens" number would drown everything that
+   * actually tells you about your day.
+   */
+  setLimits(limits) {
+    this.limits = limits || null
+    const chipEl = this.bar.querySelector('#bar-usage')
+    const chip = limitChip(this.limits)
+    chipEl.hidden = !chip
+    if (chip) {
+      chipEl.querySelector('.txt').textContent = chip.text
+      chipEl.title = chip.title
+      chipEl.classList.toggle('stale', chip.stale)
+    }
+  }
+
+  /** Whether the panel is on screen — the page only counts tokens while somebody is looking. */
+  usageOpen() {
+    return !this.$('.usage').classList.contains('closed')
+  }
+
+  setUsage(usage, threads) {
+    const body = this.$('.usage .body')
+    if (!usage) {
+      body.innerHTML = '<p class="usage-none">Nothing counted yet.</p>'
+      return
+    }
+
+    const today = usage.days.find((d) => d.date === new Date().toLocaleDateString('en-CA'))
+    const window_ = usage.days.reduce(
+      (into, d) => {
+        for (const k of ['output', 'input', 'cacheWrite', 'cacheRead', 'messages']) into[k] += d[k]
+        into.estimatedUsd += d.estimatedUsd || 0
+        for (const [model, t] of Object.entries(d.byModel)) {
+          into.byModel[model] = (into.byModel[model] || 0) + t.output
+        }
+        return into
+      },
+      { output: 0, input: 0, cacheWrite: 0, cacheRead: 0, messages: 0, estimatedUsd: 0, byModel: {} },
+    )
+
+    // Labels reach here from outside: a repo folder's name, a model id out of a transcript. Escaped
+    // for the same reason the repo list is — a folder can be named anything at all.
+    const row = (label, value, note = '') =>
+      `<div class="u-row"><span class="l">${escapeHtml(label)}</span><b>${escapeHtml(value)}</b>${
+        note ? `<span class="n">${escapeHtml(note)}</span>` : ''
+      }</div>`
+
+    const meter = (name, w) => {
+      if (!w) return ''
+      const pct = Math.min(100, Math.max(0, w.usedPercentage))
+      const tone = pct >= 90 ? 'hot' : pct >= 70 ? 'warm' : ''
+      return `
+        <div class="u-lim ${tone}">
+          <div class="u-row"><span class="l">${name}</span><b>${Math.round(pct)}%</b></div>
+          <div class="u-meter"><i style="width:${pct}%"></i></div>
+          <div class="u-note">${resetLabel(w.resetsAt)}</div>
+        </div>`
+    }
+
+    const limits = this.limits || usage.limits
+    const limitBlock = limits
+      ? `${meter('5-hour limit', limits.fiveHour)}${meter('Weekly limit', limits.sevenDay)}
+         <p class="u-asof${limits.stale ? ' stale' : ''}">${limitChip(limits)?.title || ''}</p>`
+      : `<p class="usage-none">No plan limits saved yet. Claude Code hands them to a status line, so
+           <code>tools/statusline-limits.mjs</code> has to be wrapped around yours — and they refresh
+           while a terminal session is open.</p>`
+
+    // Models are listed by output tokens: the part of a bill that is actually written, rather
+    // than the cache traffic that dwarfs it.
+    const models = Object.entries(window_.byModel)
+      .filter(([, output]) => output > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([model, output]) => row(model.replace(/^claude-/, ''), formatTokens(output)))
+      .join('')
+
+    const zones = zoneUsage(usage.sessions, threads)
+      .slice(0, 8)
+      .map((z) => row(z.name, formatTokens(z.output), `${z.messages} turns`))
+      .join('')
+
+    body.innerHTML = `
+      ${limitBlock}
+      <div class="sec-head"><span>Today</span></div>
+      ${
+        today
+          ? row('Output', formatTokens(today.output)) +
+            row('Fresh input', formatTokens(today.input + today.cacheWrite)) +
+            row('Cache reads', formatTokens(today.cacheRead)) +
+            row('Turns', String(today.messages)) +
+            row('At API list prices', `$${today.estimatedUsd.toFixed(2)}`, 'estimate')
+          : '<p class="usage-none">Nothing yet today.</p>'
+      }
+      <div class="sec-head"><span>Last ${usage.window} days</span></div>
+      ${row('Output', formatTokens(window_.output))}
+      ${row('Fresh input', formatTokens(window_.input + window_.cacheWrite))}
+      ${row('Cache reads', formatTokens(window_.cacheRead))}
+      ${row('At API list prices', `$${window_.estimatedUsd.toFixed(2)}`, 'estimate')}
+      ${models ? `<div class="sec-head"><span>Output by model</span></div>${models}` : ''}
+      ${zones ? `<div class="sec-head"><span>Output by zone</span></div>${zones}` : ''}
+      <p class="u-foot">From the transcripts on this machine — Claude Code and Cowork — read, never written.
+        ${usage.stats.files} transcripts.</p>`
   }
 
   setStats(stats) {
@@ -792,6 +907,21 @@ export class Hud {
     this.$('#btn-settings').setAttribute('aria-pressed', String(open))
     // Both live in the same slot on the right; the sidebar steps aside rather than hides.
     this.$('.side').classList.toggle('shifted', open)
+    if (open) this.toggleUsage(false)
+  }
+
+  /** Usage shares the slot settings uses, so only one of the two is ever open. */
+  toggleUsage(force) {
+    const panel = this.$('.usage')
+    const open = force ?? panel.classList.contains('closed')
+    panel.classList.toggle('closed', !open)
+    this.bar.querySelector('#bar-usage').setAttribute('aria-pressed', String(open))
+    this.$('.side').classList.toggle('shifted', open || !this.$('.settings').classList.contains('closed'))
+    if (open) {
+      this.$('.settings').classList.add('closed')
+      this.$('#btn-settings').setAttribute('aria-pressed', 'false')
+      this.actions.usageOpened?.()
+    }
   }
 
   toggleHelp(force) {
@@ -940,6 +1070,7 @@ function ago(ts) {
 const BAR_TEMPLATE = `
 <div class="stats"></div>
 <div class="sep"></div>
+<button class="btn ghost usage-chip" id="bar-usage" hidden title="Claude usage (U)"><span class="txt"></span></button>
 <button class="btn icon ghost" id="bar-panels" title="Hide the panels (H)" aria-pressed="true">${ICON.panels}</button>
 <button class="btn icon ghost" id="bar-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
 <button class="btn icon ghost" id="bar-home" title="Reset the view (0)">${ICON.home}</button>
@@ -1006,6 +1137,11 @@ const TEMPLATE = `
   <div class="body"></div>
 </div>
 
+<div class="usage panel closed">
+  <header>Claude usage <button class="btn icon ghost" id="btn-close-usage" title="Close">${ICON.close}</button></header>
+  <div class="body"></div>
+</div>
+
 <div class="thread-pop panel">
   <i class="nib"></i>
   <div class="top">
@@ -1042,6 +1178,7 @@ const TEMPLATE = `
         <div class="k"><span>Reset view</span><kbd>0</kbd></div>
         <div class="k"><span>Hide all UI</span><kbd>H</kbd> <kbd>${IS_MAC ? '⌘' : 'Ctrl'}\\</kbd></div>
         <div class="k"><span>Settings</span><kbd>S</kbd></div>
+        <div class="k"><span>Claude usage</span><kbd>U</kbd></div>
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
       </div>
       <div>

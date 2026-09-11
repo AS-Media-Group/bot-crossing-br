@@ -203,7 +203,8 @@ body {
 
 /* ── settings ────────────────────────────────────────────────────────────────────── */
 
-.settings {
+.settings,
+.usage {
   position: absolute;
   /* Level with the sidebar it sits beside. The old 78px was clearing a top bar that no
      longer exists. */
@@ -217,13 +218,15 @@ body {
   transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease;
 }
 
-.settings.closed {
+.settings.closed,
+.usage.closed {
   transform: translateX(calc(100% + 20px));
   opacity: 0;
   pointer-events: none;
 }
 
-.settings header {
+.settings header,
+.usage header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -233,7 +236,8 @@ body {
   flex: none;
 }
 
-.settings .body {
+.settings .body,
+.usage .body {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 16px 16px;
@@ -242,11 +246,13 @@ body {
   scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
 }
 
-.settings .body::-webkit-scrollbar {
+.settings .body::-webkit-scrollbar,
+.usage .body::-webkit-scrollbar {
   width: 8px;
 }
 
-.settings .body::-webkit-scrollbar-thumb {
+.settings .body::-webkit-scrollbar-thumb,
+.usage .body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.14);
   border-radius: 8px;
 }
@@ -1423,7 +1429,8 @@ kbd {
 }
 
 @media (max-width: 820px) {
-  .settings {
+  .settings,
+  .usage {
     width: min(306px, calc(100vw - 28px));
   }
   .side {
@@ -1457,7 +1464,8 @@ kbd {
     max-width: calc(100vw - 20px);
   }
   .side,
-  .settings {
+  .settings,
+  .usage {
     bottom: calc(72px + env(safe-area-inset-bottom, 0px));
   }
   .toasts,
@@ -1497,3 +1505,109 @@ kbd {
   }
 }
 .bot-crossing-canvas { cursor: grab; }
+
+/* ── Claude usage ─────────────────────────────────────────────────────────────
+   The chip in the floating bar, and the panel behind it. The four kinds of token are never
+   added together: cache reads run to billions against millions of output tokens, so a single
+   total would bury everything worth reading. */
+
+.floatbar .usage-chip {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 9px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  color: var(--ink-2, #b9bcc6);
+}
+
+.floatbar .usage-chip[aria-pressed='true'] {
+  color: var(--ink, #eceef4);
+}
+
+/* Old numbers are shown as history rather than hidden: a status line only runs in a terminal
+   session, so an afternoon in the desktop app leaves them behind. */
+.floatbar .usage-chip.stale {
+  opacity: 0.55;
+}
+
+.usage .body {
+  font-size: 12px;
+}
+
+.u-lim {
+  margin: 0 0 10px;
+}
+
+.u-meter {
+  height: 6px;
+  margin: 4px 0 3px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.u-meter i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: #6f9ff0;
+  transition: width 300ms ease;
+}
+
+.u-lim.warm .u-meter i {
+  background: #e6c67f;
+}
+
+.u-lim.hot .u-meter i {
+  background: #e88b8b;
+}
+
+.u-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.u-row .l {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2, #b9bcc6);
+}
+
+.u-row b {
+  font-variant-numeric: tabular-nums;
+}
+
+.u-row .n,
+.u-note,
+.u-asof,
+.u-foot,
+.usage-none {
+  font-size: 11px;
+  color: var(--ink-3, #8a8d98);
+}
+
+.u-asof.stale {
+  color: #e6c67f;
+}
+
+.u-foot {
+  margin: 14px 0 0;
+  line-height: 1.5;
+}
+
+.usage-none {
+  margin: 6px 0 10px;
+  line-height: 1.5;
+}
+
+.usage-none code {
+  font-size: 10.5px;
+}

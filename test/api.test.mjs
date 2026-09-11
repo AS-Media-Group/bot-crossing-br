@@ -248,3 +248,78 @@ test('a page will not merge an empty colony over the one it holds', async () => 
     globalThis.fetch = realFetch
   }
 })
+
+// ── what Claude has spent ─────────────────────────────────────────────────────
+
+test('usage is readable, and is private to the colony page like everything else', async () => {
+  const api = await apiWith(await scratch('data'))
+
+  const mine = await call(api, 'GET', '/api/usage')
+  assert.equal(mine.status, 200)
+  // The home this file runs against is empty, so there is nothing to count and nothing to hide.
+  assert.deepEqual(mine.json.days, [])
+  assert.equal(mine.json.limits, null, 'no saved limits means no numbers, never a zero')
+  assert.equal(typeof mine.json.stats.files, 'number')
+
+  const theirs = await call(api, 'GET', '/api/usage', { headers: { origin: 'http://localhost:3000' } })
+  assert.equal(theirs.status, 403, 'token counts are as private as thread titles')
+})
+
+test('usage reports the limits a status line saved beside the colony', async () => {
+  const dataDir = await scratch('data')
+  await fsp.writeFile(
+    path.join(dataDir, 'limits.json'),
+    JSON.stringify({
+      savedAt: Date.now(),
+      rate_limits: { five_hour: { used_percentage: 23.5, resets_at: 1738425600 }, seven_day: { used_percentage: 41.2, resets_at: 1738857600 } },
+    }),
+  )
+  const api = await apiWith(dataDir)
+
+  const { json } = await call(api, 'GET', '/api/usage')
+  assert.equal(json.limits.fiveHour.usedPercentage, 23.5)
+  assert.equal(json.limits.sevenDay.usedPercentage, 41.2)
+  assert.equal(json.limits.stale, false)
+})
+
+test('the bar chip can ask for the limits alone, without a scan of every transcript', async () => {
+  const dataDir = await scratch('data')
+  await fsp.writeFile(
+    path.join(dataDir, 'limits.json'),
+    JSON.stringify({ savedAt: Date.now(), rate_limits: { five_hour: { used_percentage: 12, resets_at: 1738425600 } } }),
+  )
+  const api = await apiWith(dataDir)
+
+  const { status, json } = await call(api, 'GET', '/api/limits')
+
+  assert.equal(status, 200)
+  assert.equal(json.limits.fiveHour.usedPercentage, 12)
+  // The chip is polled every minute and a token scan costs half a second of filesystem work, so
+  // the two are separate answers: this one reads a single small file.
+  assert.equal(json.days, undefined)
+  assert.equal(json.sessions, undefined)
+
+  assert.equal((await call(api, 'GET', '/api/limits', { headers: { origin: 'http://localhost:3000' } })).status, 403)
+})
+
+test('asked for no particular window, usage answers for the week', async () => {
+  const api = await apiWith(await scratch('data'))
+  assert.equal((await call(api, 'GET', '/api/usage')).json.window, 7)
+  assert.equal((await call(api, 'GET', '/api/usage?days=14')).json.window, 14)
+})
+
+test('a nonsense days parameter cannot turn a poll into a full-history scan', async () => {
+  const api = await apiWith(await scratch('data'))
+  // An unreadable ask falls back to the week; a readable one out of range is clamped into it.
+  for (const [days, window] of [
+    ['0', 1],
+    ['-5', 1],
+    ['9999', 31],
+    ['banana', 7],
+    ['', 7],
+  ]) {
+    const { status, json } = await call(api, 'GET', `/api/usage?days=${days}`)
+    assert.equal(status, 200)
+    assert.equal(json.window, window, `days=${days}`)
+  }
+})

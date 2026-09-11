@@ -11,10 +11,25 @@ import {
   openThread as harnessOpenThread,
   scanThreads,
 } from './scan.mjs'
+import { readLimits, readUsage } from './usage.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = process.env.BOT_CROSSING_DATA || path.join(here, '..', 'data')
 const STATE_FILE = path.join(DATA_DIR, 'colony.json')
+
+/**
+ * Where a Claude Code status line saves the plan limits it is handed (see
+ * `tools/statusline-limits.mjs`). Beside the colony file by default; nothing here writes it, and
+ * its absence simply means the page shows no limit numbers.
+ */
+const LIMITS_FILE = process.env.BOT_CROSSING_LIMITS || path.join(DATA_DIR, 'limits.json')
+
+/** One tally per transcript for the life of the process, so a poll only reads what has been added. */
+const usageCache = new Map()
+
+/** Days of history the page may ask for. A poll is not a way to make the server read everything. */
+const MAX_USAGE_DAYS = 31
+const DEFAULT_USAGE_DAYS = 7
 
 const STATE_VERSION = 2
 
@@ -466,6 +481,35 @@ export async function apiMiddleware(req, res, next) {
       // appearing healthy in the list while quietly contributing nothing.
       const warnings = (await harnessStatus()).filter((h) => h.detected && h.error).map((h) => h.error)
       return send(res, 200, { threads, scannedAt: Date.now(), warnings })
+    }
+
+    /**
+     * The plan limits on their own, for the chip in the floating bar.
+     *
+     * Separate from `/api/usage` because the two cost nothing alike: this reads one small file,
+     * while counting tokens walks a couple of thousand transcripts — half a second of filesystem
+     * work on a real machine. The chip is polled every minute; the count is only made while the
+     * panel that shows it is open.
+     */
+    if (url.pathname === '/api/limits' && req.method === 'GET') {
+      return send(res, 200, { limits: await readLimits(LIMITS_FILE) })
+    }
+
+    /**
+     * What Claude has spent: tokens from the transcripts, and the plan limits a status line saved.
+     *
+     * Read-only and cheap enough to poll — the first pass reads every transcript, and each one
+     * after it reads only the bytes they have grown by. The page joins `sessions` to the threads
+     * it already holds to show usage per zone, rather than this endpoint scanning them again.
+     */
+    if (url.pathname === '/api/usage' && req.method === 'GET') {
+      // `Number(null)` is 0, so a missing parameter has to be spotted before the arithmetic —
+      // clamping it lands on one day, and a usage panel showing only today is not a week.
+      const raw = url.searchParams.get('days')
+      const asked = raw === null || raw === '' ? NaN : Number(raw)
+      const days = Number.isFinite(asked) ? Math.min(MAX_USAGE_DAYS, Math.max(1, Math.trunc(asked))) : DEFAULT_USAGE_DAYS
+      const [usage, limits] = await Promise.all([readUsage({ days, cache: usageCache }), readLimits(LIMITS_FILE)])
+      return send(res, 200, { ...usage, window: days, limits })
     }
 
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {

@@ -16,6 +16,12 @@ const post = (url, payload) =>
 
 export const fetchThreads = () => req('/api/threads')
 
+/** Tokens from the transcripts, and the plan limits a status line saved. Read-only. */
+export const fetchUsage = (days = 7) => req(`/api/usage?days=${days}`)
+
+/** Just the plan limits: one small file, cheap enough to poll. */
+export const fetchLimits = () => req('/api/limits')
+
 /**
  * The colony file, and the base every later save is measured against.
  *

@@ -11,6 +11,8 @@ import { crewRig, loadCrew } from './agents/crew.js'
 import { TIMES } from './world/sky.js'
 import {
   fetchThreads,
+  fetchUsage,
+  fetchLimits,
   fetchState,
   saveState,
   openThread,
@@ -29,6 +31,8 @@ import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-project
  */
 
 const POLL_MS = 15000
+/** Usage moves in minutes, not seconds, and its limit numbers only change when a status line runs. */
+const USAGE_POLL_MS = 60000
 const app = document.getElementById('app')
 
 app.insertAdjacentHTML(
@@ -136,6 +140,9 @@ const actions = {
   },
 
   select: (id) => select(id, {}),
+
+  /** The usage panel just opened: count now rather than waiting for the next poll. */
+  usageOpened: () => refreshUsage(),
 
   focusThread: (id) => select(id, { fly: true }),
 
@@ -527,6 +534,10 @@ window.addEventListener('keydown', (e) => {
     case 'S':
       hud.toggleSettings()
       break
+    case 'u':
+    case 'U':
+      hud.toggleUsage()
+      break
     case 'n':
     case 'N':
       actions.focusStatus('waiting')
@@ -680,13 +691,50 @@ async function poll() {
       }
     }
     const res = await fetchThreads()
-    applyThreads(res.threads || [])
+    lastThreads = res.threads || []
+    applyThreads(lastThreads)
     hud.removeBoot()
+    pollUsage()
   } catch (err) {
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()
   } finally {
     polling = false
+  }
+}
+
+/** The threads the last poll saw, so usage can be attributed to the zones they live in. */
+let lastThreads = []
+let limitsAt = 0
+let usageAt = 0
+
+/**
+ * The two halves of usage, asked for at the rates they deserve.
+ *
+ * The limits behind the chip are one small file, so they are polled like anything else. Counting
+ * tokens walks a couple of thousand transcripts — half a second of filesystem work — so it only
+ * happens while the panel that shows it is open. Both fail silently: the colony is about the
+ * astronauts, and a stale number is not worth a toast.
+ */
+async function pollUsage() {
+  if (Date.now() - limitsAt >= USAGE_POLL_MS) {
+    limitsAt = Date.now()
+    try {
+      hud.setLimits((await fetchLimits()).limits)
+    } catch {
+      /* the chip keeps what it had */
+    }
+  }
+  if (!hud.usageOpen() || Date.now() - usageAt < USAGE_POLL_MS) return
+  refreshUsage()
+}
+
+async function refreshUsage() {
+  usageAt = Date.now()
+  try {
+    hud.setUsage(await fetchUsage(), lastThreads)
+  } catch {
+    /* the panel keeps whatever it last showed */
   }
 }
 

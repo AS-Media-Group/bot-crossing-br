@@ -29,7 +29,7 @@ Everything below is on the `asmg/main` branch, the default here. `main` is kept 
 mirror of upstream, so the two can be compared at any time:
 [`main...asmg/main`](https://github.com/AS-Media-Group/bot-crossing-br/compare/main...asmg/main).
 It started as an audit of the original, and each fix below came out of it. The test suite grew
-from 33 tests to 82.
+from 33 tests to 111.
 
 ### A map that tells the truth
 
@@ -99,6 +99,32 @@ Claude Code:
   of the screen, and counts at zero drop out.
 - **Clicking an astronaut *or its building* opens the thread's card**, even with the panels
   hidden. Clicking a zone while they are hidden brings them back on that repo.
+
+### What Claude has spent
+
+- **A usage chip and panel.** The bar shows `5h 24% · 7d 41%` — how much of the Claude plan's
+  5-hour and weekly windows has gone — and the panel behind it breaks the week down by day,
+  model and zone, with an estimate at API list prices.
+- **Token counts come from the transcripts already being read**, Claude Code and Cowork alike,
+  and nothing new is written. Two things the counting has to get right: one assistant message is
+  written as several lines carrying the *same* usage record, so messages are de-duplicated (55%
+  of the usage lines on a real machine are repeats), and cache reads run to billions against
+  millions of output tokens, so the four kinds of token are never added into one number.
+- **The plan limits come from Claude Code itself.** It hands them to a status-line command, and
+  [`tools/statusline-limits.mjs`](tools/statusline-limits.mjs) wraps whatever status line you
+  already have: it saves `rate_limits` beside the colony file, then runs yours unchanged. No
+  token is read and no API is called. Point `statusLine` in `~/.claude/settings.json` at it:
+
+  ```json
+  { "statusLine": { "type": "command",
+      "command": "node /path/to/tools/statusline-limits.mjs --out ~/…/limits.json -- <your old status line>" } }
+  ```
+
+  Set `BOT_CROSSING_LIMITS` if you save it anywhere other than beside `colony.json`. Without it
+  the panel says so — it never shows a zero it does not have. Status lines run in a terminal
+  session, so the chip fades when its numbers get old rather than pretending they are current.
+- **The count only runs while the panel is open.** The chip polls one small file; walking a
+  couple of thousand transcripts is about half a second of work, and it happens when you look.
 
 Design notes and plans for the larger changes are in
 [`docs/superpowers/`](docs/superpowers/).
@@ -379,6 +405,7 @@ under **View → Return to isometric**.
 | --- | --- |
 | `H` / `⌘\` | **Hide every panel.** The colony still reads: status lives above the astronauts' heads. *(This fork:)* the floating bar stays, and its panels button brings them back |
 | `S` | Settings |
+| `U` | Claude usage |
 | `N` | Fly to the next astronaut waiting on you |
 | `Enter` / `A` | Open / archive the selected thread |
 | `V` | Mark the selected thread viewed, so it stops asking |
