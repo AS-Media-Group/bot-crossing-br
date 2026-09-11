@@ -197,17 +197,22 @@ async function scanThreads() {
   const now = Date.now()
   const orgs = await orgDirs()
   const enabled = new Map()
-  for (const org of orgs) for (const [taskId, task] of await routinesIn(org)) enabled.set(taskId, task)
+  // Keyed by org too: two orgs are free to enable a routine with the same id.
+  for (const org of orgs) {
+    for (const [taskId, task] of await routinesIn(org)) enabled.set(`${path.basename(org)}:${taskId}`, task)
+  }
 
   const threads = []
   const runs = new Map()
   for (const record of await recentRecords(orgs, now)) {
     if (now - record.lastActivityAt > WINDOW_MS) continue
     if (record.scheduledTaskId || record.sessionType === 'scheduled') {
+      const orgId = path.basename(path.dirname(record.sessionDir))
+      const key = `${orgId}:${record.scheduledTaskId}`
       // A run of a routine that has since been switched off, or of none at all, is history.
-      if (!enabled.has(record.scheduledTaskId)) continue
-      if (!runs.has(record.scheduledTaskId)) runs.set(record.scheduledTaskId, [])
-      runs.get(record.scheduledTaskId).push(record)
+      if (!enabled.has(key)) continue
+      if (!runs.has(key)) runs.set(key, [])
+      runs.get(key).push(record)
       continue
     }
     threads.push(await threadFor(ID(record.sessionId), record, { folders: record.userSelectedFolders }))
@@ -217,14 +222,20 @@ async function scanThreads() {
    * One astronaut per routine, whatever it has run since. A daily routine is hundreds of records and
    * would bury every other zone on the map; as one thread it is a place to see at a glance whether
    * this morning's run worked. Its id is the routine's, not a run's, so the astronaut stays put from
-   * one day's run to the next.
+   * one day's run to the next. The org rides along in that id too, since routine ids are only unique
+   * within their own org.
    */
-  for (const [taskId, list] of runs) {
+  for (const [key, list] of runs) {
     list.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
     const latest = list[0]
-    const folders = latest.userSelectedFolders.length ? latest.userSelectedFolders : enabled.get(taskId).folders
+    const taskId = latest.scheduledTaskId
+    const folders = latest.userSelectedFolders.length ? latest.userSelectedFolders : enabled.get(key).folders
     const createdAt = Math.min(...list.map((r) => r.createdAt || r.lastActivityAt))
-    threads.push(await threadFor(ID(`task:${taskId}`), latest, { folders, routine: taskId, createdAt, fallbackTitle: taskId }))
+    threads.push(
+      await threadFor(ID(`task:${key}`), latest, {
+        folders, routine: taskId, createdAt, fallbackTitle: taskId,
+      }),
+    )
   }
   return threads
 }

@@ -850,13 +850,41 @@ test('an enabled routine is one astronaut, however often it has run; a disabled 
     await fsp.utimes(stale.file, then, then)
 
     const threads = await h.scanThreads()
-    assert.deepEqual(threads.map((t) => t.id), ['claude-cowork:task:morning-brief'])
+    assert.deepEqual(threads.map((t) => t.id), [`claude-cowork:task:${ORG}:morning-brief`])
     const [t] = threads
     assert.equal(t.title, 'brief, latest')
     assert.equal(t.routine, 'morning-brief')
     assert.equal(t.hasError, true, 'the latest run failed')
     assert.equal(t.project, 'Briefs', "placed by the routine's own folder when its runs name none")
     assert.ok(Math.abs(t.createdAt - (Date.now() - 3 * DAY)) < MINUTE, 'created when its first run in the window was')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('two orgs with a same-id enabled routine stay two astronauts, not one merged into the other', async () => {
+  const { h, root, org, cleanup } = await fakeCowork()
+  try {
+    const ORG2 = '33333333-3333-4333-8333-333333333333'
+    const org2 = path.join(root, ACCOUNT, ORG2)
+    await fsp.mkdir(org2, { recursive: true })
+    const tasks = JSON.stringify({
+      scheduledTasks: [{ id: 'morning-brief', enabled: true, userSelectedFolders: [] }],
+    })
+    await fsp.writeFile(path.join(org, 'scheduled-tasks.json'), tasks)
+    await fsp.writeFile(path.join(org2, 'scheduled-tasks.json'), tasks)
+    await writeCoworkSession(org, {
+      scheduledTaskId: 'morning-brief', sessionType: 'scheduled', title: 'org one brief',
+    })
+    await writeCoworkSession(org2, {
+      scheduledTaskId: 'morning-brief', sessionType: 'scheduled', title: 'org two brief',
+    })
+
+    const threads = await h.scanThreads()
+    assert.deepEqual(threads.map((t) => t.id).sort(), [
+      `claude-cowork:task:${ORG}:morning-brief`,
+      `claude-cowork:task:${ORG2}:morning-brief`,
+    ])
   } finally {
     await cleanup()
   }
