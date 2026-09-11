@@ -48,6 +48,10 @@ const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
 let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
+// Set once boot's fetchState has actually succeeded. Until then `state` is only a placeholder, and
+// saving it (or the auto-layout built from an empty colony) would overwrite the real file the
+// moment it becomes readable again — see queueSave and poll.
+let stateLoaded = false
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -654,6 +658,18 @@ async function poll() {
   if (polling) return
   polling = true
   try {
+    // Boot's fetchState failed, so nothing here has been saved. Retry quietly on every poll —
+    // once the file reads again, reload rather than trying to splice a late state in: it is the
+    // simplest way to pick up the real layout, settings and archive list from scratch.
+    if (!stateLoaded) {
+      try {
+        await fetchState()
+        location.reload()
+        return
+      } catch {
+        /* still unreadable — try again next poll, no repeat toast */
+      }
+    }
     const res = await fetchThreads()
     applyThreads(res.threads || [])
     hud.removeBoot()
@@ -666,6 +682,10 @@ async function poll() {
 }
 
 function queueSave() {
+  // Never overwrite the real file with the placeholder state boot() falls back to. Without this
+  // gate, the first poll's auto-layout would merge over the disk copy with no base once the file
+  // reads again, replacing whatever zone layout the file actually held.
+  if (!stateLoaded) return
   clearTimeout(pendingSave)
   pendingSave = setTimeout(async () => {
     try {
@@ -689,14 +709,19 @@ async function boot() {
     fetchState()
       .then((s) => {
         state = s
+        stateLoaded = true
         // Before the first roster: zones come back to the ground they were on last time.
         colony.restoreLayout(state.plots)
         // And the settings, but only for a browser that has none of its own — an explicit
         // choice made here always outranks the file.
         if (!hasStoredSettings() && state.settings) settings.applyAll(state.settings)
       })
-      .catch(() => {
-        /* first run, or the file is gone — an empty colony state is a valid one */
+      .catch((err) => {
+        // A first run with no file yet is not an error here — the server answers 200 with an
+        // empty state, so it takes the `.then` branch above and sets stateLoaded. Landing here
+        // means the read itself failed (a corrupt or briefly unreadable colony.json, 503). Stay
+        // unloaded so queueSave and poll don't risk the real file once it becomes readable again.
+        hud.toast(err.message || 'Could not load the saved colony', 'err')
       }),
     settle(loadKit()),
     settle(loadCrew()),
