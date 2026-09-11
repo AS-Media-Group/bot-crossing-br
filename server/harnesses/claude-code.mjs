@@ -779,7 +779,9 @@ async function openThread(ref) {
  * written: the desktop app just opens an empty session with that folder as its workspace.
  */
 async function newSession(dir) {
-  const url = `claude://code/new?${new URLSearchParams({ folder: dir })}`
+  // encodeURIComponent, not URLSearchParams: the quick action sends `%20`, and `+` only means a
+  // space to a form parser — a handler that decodes with decodeURIComponent reads a literal plus.
+  const url = `claude://code/new?folder=${encodeURIComponent(dir)}`
   let command
   if (process.platform === 'linux') {
     const bin = await cliBinary()

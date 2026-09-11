@@ -584,3 +584,13 @@ test(
     }
   }
 )
+
+test("a new conversation's folder is %-encoded, the way the app's own Finder quick action sends it", async () => {
+  // URLSearchParams form-encodes a space as `+`, which a handler decoding with decodeURIComponent
+  // reads as a literal plus — a folder that does not exist. %20 reads the same under either parser.
+  const { url } = await claudeCode.newSession('/tmp/Claude code ')
+  assert.equal(url, 'claude://code/new?folder=%2Ftmp%2FClaude%20code%20')
+  assert.equal(new URL(url).searchParams.get('folder'), '/tmp/Claude code ')
+  assert.equal(decodeURIComponent(url.split('folder=')[1]), '/tmp/Claude code ')
+  assert.equal(codex.newSession('/tmp/some repo').url, 'codex://threads/new?path=%2Ftmp%2Fsome%20repo')
+})

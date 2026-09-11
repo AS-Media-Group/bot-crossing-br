@@ -315,7 +315,8 @@ function openThread(ref) {
 }
 
 function newSession(dir) {
-  return { ok: true, url: `codex://threads/new?${new URLSearchParams({ path: dir })}` }
+  // %20 for a space, not a form-encoded `+`: it reads the same whichever way the app decodes it.
+  return { ok: true, url: `codex://threads/new?path=${encodeURIComponent(dir)}` }
 }
 
 /** Claim the machine if either store is there — a CLI-only install has no database. */
