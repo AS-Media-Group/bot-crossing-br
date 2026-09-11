@@ -37,7 +37,13 @@ export default defineConfig({
       allow: [root],
       // Replaces Vite's defaults rather than adding to them, so those are restated first. A pattern
       // containing a slash is matched against the absolute path, hence the leading globstar.
-      deny: ['.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/data/colony.json*', '**/.claude/**'],
+      // The `.claude` pattern is anchored at this checkout rather than any ancestor: a Claude Code
+      // worktree lives *inside* a `.claude/` folder, and `**/.claude/**` there denies every file the
+      // app has (index.html, /src/main.js, all of it) — `npm run dev` 403s on its own app.
+      deny: [
+        '.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/data/colony.json*',
+        `${root.split(path.sep).join('/').replace(/[()[\]{}!*?+@]/g, '\\$&')}/.claude/**`,
+      ],
     },
   },
   build: { target: 'esnext' },
