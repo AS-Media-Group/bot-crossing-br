@@ -43,6 +43,12 @@ const STORE = process.env.BOT_CROSSING_COWORK_SESSIONS || path.join(claudeDataDi
  */
 const WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
+/**
+ * How recently a live session's transcript must have moved to count as working. A process on its
+ * own is not enough: one can outlive its work, and a session at rest writes nothing.
+ */
+const ACTIVE_WINDOW_MS = 30 * 60 * 1000
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const RECORD = /^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i
 /** A routine's id becomes part of a thread id, so only the app's own kebab-case shape is taken. */
@@ -143,6 +149,52 @@ async function routinesIn(org) {
   return out
 }
 
+/**
+ * A session's transcript: `<sessionDir>/.claude/projects/<folder>/<cliSessionId>.jsonl`. The folder is
+ * the CLI's encoding of the session's cwd — lossy, and here also truncated and hash-suffixed — so it
+ * is found by listing one level and asking for the exact file name, never by decoding it.
+ */
+async function transcriptOf(run) {
+  if (!UUID.test(run.cliSessionId)) return null
+  for (const dir of await listDirs(path.join(run.sessionDir, '.claude', 'projects'))) {
+    try {
+      const st = await fsp.stat(path.join(dir, `${run.cliSessionId}.jsonl`))
+      if (st.isFile()) return { size: st.size, mtime: st.mtimeMs }
+    } catch {
+      /* not in this one */
+    }
+  }
+  return null
+}
+
+/**
+ * Whether the session's CLI is running on this machine now. Its registry sits in the session's own
+ * folder, and a pid in it is probed only when the registry says the pid is one of this machine's
+ * (`pidDomain`) and the session ran on the host: a session in the app's VM has a pid that names
+ * nothing here, or worse, somebody else's process. EPERM is a process that exists and is not ours
+ * to signal — alive.
+ */
+async function isLive(run) {
+  if (!run.hostLoopMode || !UUID.test(run.cliSessionId)) return false
+  for (const file of await listFiles(path.join(run.sessionDir, '.claude', 'sessions'), (n) => n.endsWith('.json'))) {
+    let registry
+    try {
+      registry = JSON.parse(await fsp.readFile(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (registry?.sessionId !== run.cliSessionId || registry.pidDomain !== process.platform) continue
+    if (!Number.isInteger(registry.pid) || registry.pid <= 0) continue
+    try {
+      process.kill(registry.pid, 0) // signal 0 only tests for existence
+      return true
+    } catch (err) {
+      if (err.code === 'EPERM') return true
+    }
+  }
+  return false
+}
+
 /** The first folder that is still a directory on this machine, or `''` — checked, never assumed. */
 async function firstFolder(folders) {
   for (const folder of folders) {
@@ -162,8 +214,10 @@ async function firstFolder(folders) {
  * zone when it was given none that still exists. A session's own cwd is a scratch `outputs`
  * folder inside the store, which is nobody's idea of where the work lives.
  */
-async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallbackTitle = '' }) {
+async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallbackTitle = '' }, now) {
   const folder = await firstFolder(folders)
+  const transcript = await transcriptOf(run)
+  const live = transcript ? await isLive(run) : false
   return {
     id,
     title: run.title || fallbackTitle || 'Untitled session',
@@ -180,13 +234,13 @@ async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallba
     // Cowork keeps no focus history, so "have you read this" is unknowable rather than false.
     lastFocusedAt: 0,
     unread: false,
-    running: false,
+    running: live && now - transcript.mtime < ACTIVE_WINDOW_MS,
     hasError: run.hasError,
     starred: run.isStarred,
     routine,
     prState: '',
     archived: run.isArchived,
-    sizeBytes: 0,
+    sizeBytes: transcript ? transcript.size : 0,
     source: 'cowork',
     canOpen: false,
     ref: { sessionId: run.sessionId },
@@ -215,7 +269,7 @@ async function scanThreads() {
       runs.get(key).push(record)
       continue
     }
-    threads.push(await threadFor(ID(record.sessionId), record, { folders: record.userSelectedFolders }))
+    threads.push(await threadFor(ID(record.sessionId), record, { folders: record.userSelectedFolders }, now))
   }
 
   /*
@@ -234,7 +288,7 @@ async function scanThreads() {
     threads.push(
       await threadFor(ID(`task:${key}`), latest, {
         folders, routine: taskId, createdAt, fallbackTitle: taskId,
-      }),
+      }, now),
     )
   }
   return threads

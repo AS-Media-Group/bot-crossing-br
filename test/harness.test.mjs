@@ -889,3 +889,64 @@ test('two orgs with a same-id enabled routine stay two astronauts, not one merge
     await cleanup()
   }
 })
+
+/** A Cowork transcript where the CLI keeps it: one opaque folder down, named by the CLI, not by us. */
+async function writeCoworkTranscript(dir, cliSessionId, bytes) {
+  const folder = path.join(dir, '.claude', 'projects', '-sessions-truncated-name-9f3a2c')
+  await fsp.mkdir(folder, { recursive: true })
+  const file = path.join(folder, `${cliSessionId}.jsonl`)
+  await fsp.writeFile(file, 'x'.repeat(bytes - 1) + '\n')
+  return file
+}
+
+async function writeCoworkRegistry(dir, fields) {
+  const folder = path.join(dir, '.claude', 'sessions')
+  await fsp.mkdir(folder, { recursive: true })
+  await fsp.writeFile(path.join(folder, `${fields.pid}.json`), JSON.stringify(fields))
+}
+
+test('a Cowork thread is as big as its transcript, found without decoding the folder it sits in', async () => {
+  const { h, org, cleanup } = await fakeCowork()
+  try {
+    const { dir, record } = await writeCoworkSession(org, { title: 'sized' })
+    await writeCoworkTranscript(dir, record.cliSessionId, 4096)
+    const [t] = await h.scanThreads()
+    assert.equal(t.sizeBytes, 4096)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a Cowork session running on this machine now is working; a VM one, or a quiet one, is not', async () => {
+  const { h, org, cleanup } = await fakeCowork()
+  try {
+    const live = await writeCoworkSession(org, { title: 'live' })
+    await writeCoworkTranscript(live.dir, live.record.cliSessionId, 100)
+    await writeCoworkRegistry(live.dir, { pid: process.pid, sessionId: live.record.cliSessionId, pidDomain: process.platform })
+
+    // Ran in the app's VM: its pid names nothing here, so it is never probed.
+    const vm = await writeCoworkSession(org, { title: 'vm', hostLoopMode: false })
+    await writeCoworkTranscript(vm.dir, vm.record.cliSessionId, 100)
+    await writeCoworkRegistry(vm.dir, { pid: process.pid, sessionId: vm.record.cliSessionId, pidDomain: process.platform })
+
+    // An older registry with no pidDomain cannot say whose pid it is.
+    const unknown = await writeCoworkSession(org, { title: 'unknown' })
+    await writeCoworkTranscript(unknown.dir, unknown.record.cliSessionId, 100)
+    await writeCoworkRegistry(unknown.dir, { pid: process.pid, sessionId: unknown.record.cliSessionId })
+
+    // Live process, but its transcript has not moved in two hours.
+    const quiet = await writeCoworkSession(org, { title: 'quiet' })
+    const file = await writeCoworkTranscript(quiet.dir, quiet.record.cliSessionId, 100)
+    const then = new Date(Date.now() - 2 * HOUR)
+    await fsp.utimes(file, then, then)
+    await writeCoworkRegistry(quiet.dir, { pid: process.pid, sessionId: quiet.record.cliSessionId, pidDomain: process.platform })
+
+    const byTitle = Object.fromEntries((await h.scanThreads()).map((t) => [t.title, t]))
+    assert.equal(byTitle.live.running, true)
+    assert.equal(byTitle.vm.running, false)
+    assert.equal(byTitle.unknown.running, false)
+    assert.equal(byTitle.quiet.running, false)
+  } finally {
+    await cleanup()
+  }
+})
