@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { inject } from './support/inject.mjs'
 
 const scratch = (label) => fsp.mkdtemp(path.join(os.tmpdir(), `bot-crossing-${label}-`))
@@ -76,4 +77,36 @@ test("this machine's LAN address is not trusted unless the colony was served to 
   const api = await apiWith(await scratch('data'))
   const host = `${lan.address}:5274`
   assert.equal((await call(api, 'GET', '/api/state', { headers: { host, origin: `http://${host}` } })).status, 403)
+})
+
+// ── what it will act on ───────────────────────────────────────────────────────
+
+/**
+ * Stand-ins for `open` / `xdg-open`, first on PATH, that only write down what they were asked to
+ * open. A test that expects nothing to launch can then prove it — and one that fails on the way to
+ * that proof opens nothing on the machine running it.
+ */
+async function fakeOpener() {
+  const bin = await scratch('bin')
+  const log = path.join(bin, 'opened.log')
+  const script = `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\n`
+  for (const name of ['open', 'xdg-open']) await fsp.writeFile(path.join(bin, name), script, { mode: 0o755 })
+  process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`
+  return { opened: async () => (await fsp.readFile(log, 'utf8').catch(() => '')).split('\n').filter(Boolean) }
+}
+
+test('reveal and new session refuse a folder no thread ever ran in', { skip: process.platform === 'win32' }, async () => {
+  const opener = await fakeOpener()
+  const api = await apiWith(await scratch('data'))
+  const stranger = await scratch('stranger') // exists, is a directory, and no thread ever ran in it
+  const bundle = path.join(stranger, 'Calculator.app') // `open` launches one of these
+  await fsp.mkdir(bundle)
+  for (const url of ['/api/reveal', '/api/new-session']) {
+    for (const folder of [stranger, bundle]) {
+      const res = await call(api, 'POST', url, { body: { folder, harness: 'claude-code' } })
+      assert.equal(res.status, 400, `${url} ${folder}`)
+    }
+  }
+  await delay(200) // the opener is spawned detached; give a mistaken one time to write its log
+  assert.deepEqual(await opener.opened(), [], 'nothing was handed to the opener')
 })

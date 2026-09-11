@@ -35,6 +35,9 @@ export function inject(handler, { method = 'GET', url = '/', headers = {}, body 
     for (const [k, v] of Object.entries(headers)) if (v !== undefined) req.headers[k.toLowerCase()] = v
     if (body !== undefined) req.push(typeof body === 'string' ? body : JSON.stringify(body))
     req.push(null)
+    // The body is all there is. Without this, IncomingMessage's auto-destroy reads the finished
+    // stream as an aborted request and tears the socket down before the response can flush.
+    req.complete = true
 
     const res = new http.ServerResponse(req)
     res.assignSocket(socket)

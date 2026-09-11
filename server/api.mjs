@@ -175,6 +175,33 @@ async function resolveFolder(folder) {
 }
 
 /**
+ * Every folder a scanned thread named — its repo, and the folder it runs in. A folder the page asks
+ * to reveal or start a session in has to be one of these, not merely a directory that exists:
+ * `/System/Applications/Calculator.app` is a directory that exists, and `open` launches it.
+ *
+ * The page only ever names a thread's own folders, so nothing it does is refused. The set is
+ * refreshed on every poll, and a miss triggers one scan of its own first, in case the page holds a
+ * thread this process has not seen yet — just restarted, say.
+ */
+let knownFolders = new Set()
+
+function learnFolders(threads) {
+  const next = new Set()
+  for (const t of threads) {
+    for (const folder of [t.projectPath, t.cwd]) {
+      if (typeof folder === 'string' && path.isAbsolute(folder)) next.add(path.resolve(folder))
+    }
+  }
+  knownFolders = next
+}
+
+async function isKnownFolder(dir) {
+  if (knownFolders.has(dir)) return true
+  learnFolders(await scanThreads())
+  return knownFolders.has(dir)
+}
+
+/**
  * Show a harness's answer to "open this" — `{ ok, url, command }` — and say truthfully whether
  * anything happened.
  *
@@ -208,6 +235,8 @@ async function present(result) {
     if (!result.command.cwd) return { ok: false, error: 'That thread has no folder on record to resume in' }
     const cwd = await resolveFolder(result.command.cwd)
     if (!cwd) return { ok: false, error: 'The folder that thread ran in is not on this machine any more' }
+    // It arrived inside `ref`, from the page — the same allowlist as any folder the page names.
+    if (!(await isKnownFolder(cwd))) return { ok: false, error: 'Bot Crossing has no thread in that folder' }
     // A folder that exists but cannot be entered fails inside every terminal alike, and the
     // terminal gets the blame; say what is actually wrong instead.
     const enterable = await fsp.access(cwd, fsp.constants.X_OK).then(() => true, () => false)
@@ -390,6 +419,7 @@ export async function apiMiddleware(req, res, next) {
   try {
     if (url.pathname === '/api/threads' && req.method === 'GET') {
       const threads = await reconcileArchived(await scanThreads())
+      learnFolders(threads)
       // A harness that is present but cannot read its own store says so here, rather than
       // appearing healthy in the list while quietly contributing nothing.
       const warnings = (await harnessStatus()).filter((h) => h.detected && h.error).map((h) => h.error)
@@ -441,6 +471,9 @@ export async function apiMiddleware(req, res, next) {
       const { folder, harness } = await readJsonBody(req)
       const dir = await resolveFolder(folder)
       if (!dir) return send(res, 400, { ok: false, error: 'That folder is not on this machine any more' })
+      if (!(await isKnownFolder(dir))) {
+        return send(res, 400, { ok: false, error: 'Bot Crossing has no thread in that folder' })
+      }
 
       if (url.pathname === '/api/reveal') {
         launch(dir)
