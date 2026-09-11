@@ -383,3 +383,48 @@ test('a transcript that never names its cwd borrows one that encodes to its fold
     await cleanup()
   }
 })
+
+test('a thread is as recent as its last timestamped record, not a metadata write months later', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const spoke = ago(10 * DAY)
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('hello', { sessionId: id, cwd, timestamp: spoke }),
+      answers({ sessionId: id, cwd, timestamp: spoke }),
+      // What the desktop app appends long afterwards, with no timestamp of its own.
+      { type: 'custom-title', customTitle: 'renamed later', sessionId: id },
+      { type: 'mode', mode: 'default', sessionId: id },
+    ])
+    const now = new Date()
+    await fsp.utimes(file, now, now)
+    const [t] = await h.scanThreads()
+    assert.equal(t.lastActivityAt, Date.parse(spoke))
+    assert.equal(t.title, 'renamed later')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a session that moved into a worktree reports the worktree, and the branch it is on now', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const wt = `${REPO}/.claude/worktrees/feature-x`
+    const id = randomUUID()
+    // The transcript moves with the session, so it lives in the worktree's folder.
+    await writeTranscript(h, wt, id, [
+      userSays('start', { sessionId: id, cwd: REPO, gitBranch: 'main', timestamp: ago(HOUR) }),
+      { type: 'relocated', sessionId: id, relocatedCwd: wt },
+      userSays('carry on', { sessionId: id, cwd: wt, gitBranch: 'worktree-feature-x', timestamp: ago(50 * MINUTE) }),
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.cwd, wt)
+    assert.equal(t.worktree, 'feature-x')
+    assert.equal(t.project, 'my-repo')
+    assert.equal(t.gitBranch, 'worktree-feature-x')
+    assert.equal(t.ref.cwd, wt, 'resuming has to happen where the session is, not where it began')
+  } finally {
+    await cleanup()
+  }
+})

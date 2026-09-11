@@ -317,6 +317,65 @@ async function openingMeta(entry) {
 }
 
 /**
+ * What only the end of a transcript knows: when it last really did something, where it works
+ * now, and what it is called now.
+ *
+ * "When it last did something" is its last *timestamped* record, not the file's mtime. The app
+ * appends untimestamped bookkeeping — titles, modes, bridge and artifact records — to transcripts
+ * in bulk, days or months after a conversation ended, and a colony reading mtime woke every one of
+ * those threads from its three-day sleep at once.
+ *
+ * Later records win throughout: a thread renamed twice is called what it was renamed to last, and
+ * a session that moved into a worktree is on the worktree's branch now, not the one it began on.
+ */
+function readTranscriptTail(records) {
+  const tail = { lastRecordAt: 0, relocatedCwd: '', gitBranch: '', customTitle: '', aiTitle: '' }
+  for (const r of records) {
+    const t = r.timestamp ? Date.parse(r.timestamp) : NaN
+    if (!Number.isNaN(t) && t > tail.lastRecordAt) tail.lastRecordAt = t
+    if (typeof r.relocatedCwd === 'string' && r.relocatedCwd) tail.relocatedCwd = r.relocatedCwd
+    if (r.gitBranch && r.gitBranch !== 'HEAD') tail.gitBranch = r.gitBranch
+    if (r.customTitle) tail.customTitle = r.customTitle
+    if (r.aiTitle) tail.aiTitle = r.aiTitle
+  }
+  return tail
+}
+
+/** The tail, like the head, is kept until the file changes. */
+const tailCache = new Map()
+async function transcriptTail(entry) {
+  const cached = tailCache.get(entry.id)
+  if (cached && cached.mtime === entry.mtime) return cached.tail
+  let tail
+  try {
+    tail = readTranscriptTail(jsonLines(await readTail(entry.file, TAIL_BYTES)))
+  } catch {
+    tail = readTranscriptTail([])
+  }
+  tailCache.set(entry.id, { mtime: entry.mtime, tail })
+  return tail
+}
+
+/** When a transcript last did something: its last timestamped record, or its mtime if it has none. */
+const activityOf = (entry, tail) => tail.lastRecordAt || entry.mtime
+
+/** The CLI's own title precedence — custom, then AI, then summary, then first prompt — latest first. */
+const titleOf = (meta, tail) =>
+  tail?.customTitle || meta?.customTitle || tail?.aiTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || ''
+
+/**
+ * Where a terminal thread works. Its transcript's folder is named after the cwd it lives in *now*
+ * — a session that moves into a worktree has its transcript moved with it — so whichever cwd it
+ * reported that encodes to that name wins over the one it happened to start in.
+ */
+function whereItRuns(dirName, meta, tail, known) {
+  for (const cwd of [tail.relocatedCwd, meta.cwd]) {
+    if (cwd && encodeProjectDir(cwd) === dirName) return cwd
+  }
+  return meta.cwd || resolveProjectDir(dirName, known)
+}
+
+/**
  * Sessions with a CLI process actually alive right now. The registry keeps files for
  * processes that have exited, so every pid is probed before it counts.
  */
@@ -445,9 +504,11 @@ async function scanThreads() {
     const cwd = s.cwd || s.originCwd || ''
     const { projectPath, project, worktree } = projectOf(cwd, s.originCwd)
     const meta = entry ? await transcriptMeta(entry) : null
+    const tail = entry ? await transcriptTail(entry) : null
     learn(s.cwd)
     learn(s.originCwd)
     learn(meta?.cwd)
+    learn(tail?.relocatedCwd)
 
     add({
       id: ID(cliSessionId || s.sessionId),
@@ -456,13 +517,13 @@ async function scanThreads() {
       desktopSessionIds: s.sessionId ? [s.sessionId] : [],
       titled: Boolean(s.title),
       bridgeSessionId: (s.bridgeSessionIds && s.bridgeSessionIds[0]) || '',
-      title: s.title || meta?.customTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || 'Untitled thread',
+      title: s.title || titleOf(meta, tail) || 'Untitled thread',
       preview: meta?.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
       project,
       projectPath,
       worktree,
       cwd,
-      gitBranch: meta?.gitBranch || '',
+      gitBranch: tail?.gitBranch || meta?.gitBranch || '',
       model: s.model || '',
       effort: s.effort || '',
       createdAt: num(s.createdAt) || meta?.startedAt || 0,
@@ -471,7 +532,7 @@ async function scanThreads() {
       // old while its transcript is being written to right now. The later of the two is true.
       lastActivityAt: Math.max(
         num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
-        entry?.mtime || 0
+        entry ? activityOf(entry, tail) : 0
       ),
       // Kept apart from the above. "Unread" compares against when you last *looked*, and both
       // sides have to come from the app's own bookkeeping: measure a transcript mtime against
@@ -498,31 +559,33 @@ async function scanThreads() {
   for (const [id, entry] of transcripts) {
     if (claimed.has(id)) continue
     const meta = await transcriptMeta(entry)
+    const tail = await transcriptTail(entry)
     learn(meta.cwd)
-    loose.push({ id, entry, meta })
+    learn(tail.relocatedCwd)
+    loose.push({ id, entry, meta, tail })
   }
 
-  for (const { id, entry, meta } of loose) {
-    const cwd = meta.cwd || resolveProjectDir(path.basename(entry.projectDir), known)
+  for (const { id, entry, meta, tail } of loose) {
+    const cwd = whereItRuns(path.basename(entry.projectDir), meta, tail, known)
     const { projectPath, project, worktree } = projectOf(cwd, '')
     add({
       id: ID(id),
       cliSessionId: id,
       desktopSessionId: '',
       desktopSessionIds: [],
-      titled: Boolean(meta.customTitle || meta.aiTitle),
+      titled: Boolean(tail.customTitle || meta.customTitle || tail.aiTitle || meta.aiTitle),
       bridgeSessionId: '',
-      title: meta.customTitle || meta.aiTitle || meta.summary || meta.firstPrompt || 'Untitled thread',
+      title: titleOf(meta, tail) || 'Untitled thread',
       preview: meta.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
       project,
       projectPath,
       worktree,
       cwd,
-      gitBranch: meta.gitBranch,
+      gitBranch: tail.gitBranch || meta.gitBranch,
       model: '',
       effort: '',
       createdAt: meta.startedAt || entry.mtime,
-      lastActivityAt: entry.mtime,
+      lastActivityAt: activityOf(entry, tail),
       lastFocusedAt: 0,
       hasLiveProcess: live.has(id),
       hasError: false,
