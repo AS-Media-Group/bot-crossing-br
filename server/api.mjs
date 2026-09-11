@@ -280,15 +280,20 @@ function send(res, status, body) {
   res.end(payload)
 }
 
-const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1'])
+const LOCAL_HOSTS = new Set(LOOPBACK)
 
-// The machine's own LAN addresses count as local too, so the colony can be
-// served to the home network with BOT_CROSSING_HOST set. Harmless when bound
-// to loopback (those hosts can't reach the server anyway), and the Host +
-// Origin pairing still stops DNS rebinding and CSRF exactly as before.
-for (const addrs of Object.values(os.networkInterfaces())) {
-  for (const a of addrs || []) {
-    if (a && a.family === 'IPv4' && !a.internal && a.address) LOCAL_HOSTS.add(a.address)
+/**
+ * The machine's own LAN addresses count as local only when the colony has been served to the
+ * network on purpose, with BOT_CROSSING_HOST. Trusted unconditionally, they let a page served from
+ * this machine's LAN address — on any port, by anything — pass as this server's own page.
+ */
+const BIND = process.env.BOT_CROSSING_HOST || ''
+if (BIND && !LOOPBACK.has(hostnameOf(BIND))) {
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a && a.family === 'IPv4' && !a.internal && a.address) LOCAL_HOSTS.add(a.address)
+    }
   }
 }
 
@@ -314,18 +319,39 @@ function hostnameOf(value) {
  *   - **Origin** stops CSRF. A cross-site `fetch` with a `text/plain` body is not
  *     preflighted, so without this check any page you happened to be visiting could POST
  *     here — spawning sessions, opening Finder windows, or wiping the colony layout —
- *     even though it could never read the reply.
+ *     even though it could never read the reply. It must name this server exactly, port
+ *     included: every other page on localhost shares its hostname.
  *
  * A state-changing request with no `Origin` at all is refused: browsers always send one on
  * POST/PUT, so its absence means the caller is not the page. That does mean a bare `curl`
  * POST is rejected; pass `-H 'Origin: http://localhost:5274'` if you are scripting this.
  */
 function isLocalRequest(req) {
-  if (!LOCAL_HOSTS.has(hostnameOf(req.headers.host))) return false
+  if (!isLocalHost(req)) return false
+
+  // The browser says outright where a request came from. `same-site` is the one that matters:
+  // another page on localhost, on any other port, is the same *site* as this one — so it passed a
+  // hostname check, and could read every thread on the machine.
+  const site = req.headers['sec-fetch-site']
+  if (site && site !== 'same-origin' && site !== 'none') return false
 
   const origin = req.headers.origin
-  if (origin && origin !== 'null') return LOCAL_HOSTS.has(hostnameOf(origin))
+  if (origin && origin !== 'null') return sameServer(origin, req.headers.host)
   return req.method === 'GET' || req.method === 'HEAD'
+}
+
+/** Whether a request's Host is one this server answers to — the DNS-rebinding half of the check. */
+export function isLocalHost(req) {
+  return LOCAL_HOSTS.has(hostnameOf(req.headers.host))
+}
+
+/** Origin and Host name the same server, down to the port. */
+function sameServer(origin, host) {
+  try {
+    return new URL(origin).host === new URL(`http://${host}`).host
+  } catch {
+    return false
+  }
 }
 
 function readJsonBody(req, limit = 4 * 1024 * 1024) {

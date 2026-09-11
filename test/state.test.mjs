@@ -63,7 +63,7 @@ async function withServer(run) {
   const port = server.address().port
   const call = (p, opts) =>
     fetch(`http://127.0.0.1:${port}${p}`, {
-      headers: { Origin: `http://localhost:${port}`, 'Content-Type': 'application/json' },
+      headers: { Origin: `http://127.0.0.1:${port}`, 'Content-Type': 'application/json' },
       ...opts,
     })
   try {
