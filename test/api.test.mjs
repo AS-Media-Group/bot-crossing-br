@@ -80,6 +80,41 @@ test("this machine's LAN address is not trusted unless the colony was served to 
   assert.equal((await call(api, 'GET', '/api/state', { headers: { host, origin: `http://${host}` } })).status, 403)
 })
 
+/** The API read once at import, with BOT_CROSSING_ALLOWED_HOSTS set only for that import. */
+async function apiAllowing(names) {
+  process.env.BOT_CROSSING_ALLOWED_HOSTS = names
+  try {
+    return await apiWith(await scratch('data'))
+  } finally {
+    delete process.env.BOT_CROSSING_ALLOWED_HOSTS
+  }
+}
+
+test('a name listed in BOT_CROSSING_ALLOWED_HOSTS is answered, as its own origin, for reads and saves', async () => {
+  // What Tailscale Serve forwards: the Mac's tailnet name, over https, or its short MagicDNS name.
+  const api = await apiAllowing('asmg-mac-9.tail1234.ts.net, ASMG-Mac-9')
+  for (const [host, origin] of [
+    ['asmg-mac-9.tail1234.ts.net', 'https://asmg-mac-9.tail1234.ts.net'],
+    ['asmg-mac-9', 'http://asmg-mac-9'],
+  ]) {
+    const headers = { host, origin, 'sec-fetch-site': 'same-origin' }
+    assert.equal((await call(api, 'GET', '/api/state', { headers })).status, 200, host)
+    // Answered rather than refused: a first save lands (200), a later base-less one is sent to merge (409).
+    assert.notEqual((await call(api, 'PUT', '/api/state', { headers, body: { archived: [] } })).status, 403, host)
+  }
+})
+
+test('an allowed name widens nothing else: other hosts, and other origins on it, are still refused', async () => {
+  const api = await apiAllowing('asmg-mac-9.tail1234.ts.net')
+  assert.equal((await call(api, 'GET', '/api/state', { headers: { host: 'evil.example', origin: undefined } })).status, 403)
+  const crossSite = { host: 'asmg-mac-9.tail1234.ts.net', origin: 'https://evil.example' }
+  assert.equal((await call(api, 'PUT', '/api/state', { headers: crossSite, body: { archived: [] } })).status, 403)
+  // With the variable unset, the tailnet name is just another foreign Host.
+  const plain = await apiWith(await scratch('data'))
+  const tailnet = { host: 'asmg-mac-9.tail1234.ts.net', origin: 'https://asmg-mac-9.tail1234.ts.net' }
+  assert.equal((await call(plain, 'GET', '/api/state', { headers: tailnet })).status, 403)
+})
+
 // ── what it will act on ───────────────────────────────────────────────────────
 
 /**

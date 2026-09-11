@@ -357,6 +357,17 @@ if (BIND && !LOOPBACK.has(hostnameOf(BIND))) {
   }
 }
 
+/**
+ * Extra names this server answers to, for a proxy on this machine that forwards requests under a name
+ * of its own — Tailscale Serve hands them over as the Mac's tailnet name. Exact hostnames only, and
+ * only from this machine's own environment: no page can add one, so DNS rebinding stays closed for
+ * every other name, and the Origin still has to name the same server.
+ */
+for (const name of (process.env.BOT_CROSSING_ALLOWED_HOSTS || '').split(',')) {
+  const host = hostnameOf(name.trim())
+  if (host) LOCAL_HOSTS.add(host)
+}
+
 /** Hostname out of a `Host:` or `Origin:` value, with the port and any brackets stripped. */
 function hostnameOf(value) {
   if (!value) return ''

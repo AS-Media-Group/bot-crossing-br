@@ -609,6 +609,23 @@ BOT_CROSSING_HOST=0.0.0.0 npm start
 Only then are this machine's own LAN addresses accepted as a `Host`; bound to loopback they are
 refused, so a page served from the LAN address by something else cannot pass as the colony.
 
+### Reaching it from your own devices, anywhere
+
+Rather than binding to the network, keep the server on loopback and let
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) publish it to your own tailnet — your devices,
+signed in to your account, and nothing public (Serve, never Funnel). Serve forwards requests under the
+machine's tailnet name, so list the names it may arrive as:
+
+```bash
+BOT_CROSSING_ALLOWED_HOSTS=my-mac.tail1234.ts.net,my-mac npm run serve
+tailscale serve --bg http://127.0.0.1:5274
+```
+
+Exact hostnames only, from this machine's environment — no page can add one, so every other name is
+still refused, and the `Origin` must still name the same server. Everything above about what the colony
+hands out applies to every device on the tailnet. Open and New conversation still act on the machine
+running the colony.
+
 **Understand what that hands out before you do it.** The two checks above stop a *web page* from
 driving the server; they are not access control, and they do nothing about another device asking
 directly. Anyone who can reach the port gets every thread title, every opening prompt, every
