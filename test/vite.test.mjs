@@ -9,7 +9,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createServer } from 'vite'
+import { createServer, isFileLoadingAllowed } from 'vite'
 import { inject } from './support/inject.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -30,7 +30,10 @@ const server = await createServer({
   server: { middlewareMode: true, hmr: false, ws: false, watch: null },
   optimizeDeps: { noDiscovery: true, include: [] },
 })
-after(() => server.close())
+after(async () => {
+  await server.close()
+  await fsp.rm(scratch, { recursive: true, force: true })
+})
 
 const HOST = 'localhost:5274'
 const get = (url, headers = {}) => inject(server.middlewares, { url, headers: { host: HOST, ...headers } })
@@ -40,7 +43,19 @@ const fsUrl = (...parts) => '/@fs' + path.join(root, ...parts).split(path.sep).m
 test('the dev server will not hand out the colony file or anything under .claude', { skip: process.platform === 'win32' }, async () => {
   assert.equal((await get('/.claude/launch.json')).status, 403)
   assert.equal((await get(fsUrl('.claude', 'launch.json'))).status, 403)
-  assert.equal((await get(fsUrl('data', 'colony.json'))).status, 403)
+  // Vite's own access rule, not an HTTP round trip: checkLoadingAccess only answers 403 for a
+  // denied path that is readable on disk, so an HTTP assertion here would pass or fail depending
+  // on whether an untracked data/colony.json happens to exist — this needs no file at all.
+  assert.equal(
+    isFileLoadingAllowed(server.config, path.join(root, 'data', 'colony.json')),
+    false,
+    'the colony file is behind the deny list whether or not it exists yet',
+  )
+  assert.equal(
+    isFileLoadingAllowed(server.config, path.join(root, 'src', 'main.js')),
+    true,
+    'the deny list is not simply denying everything',
+  )
 })
 
 test('the app itself is still served', async () => {
