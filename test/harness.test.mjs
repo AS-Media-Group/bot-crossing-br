@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 import { HARNESSES } from '../server/harnesses/index.mjs'
 import codex from '../server/harnesses/codex.mjs'
@@ -268,4 +269,117 @@ test('Cursor offers a folder link but never a per-thread one it cannot honour', 
   assert.ok(opened.url.includes('%20'), 'a space in the path is escaped, not left raw')
   assert.equal(h.newSession('relative/path').ok, false)
   await fsp.rm(home, { recursive: true, force: true })
+})
+
+// ── Claude Code, faked on disk ────────────────────────────────────────────────
+
+const MINUTE = 60 * 1000
+const HOUR = 60 * MINUTE
+const DAY = 24 * HOUR
+const ago = (ms) => new Date(Date.now() - ms).toISOString()
+
+/**
+ * The adapter works out every path it reads from the home directory once, at import. So a fixture
+ * home is put in place for exactly one fresh, cache-busted import and then taken away again — by
+ * the time the import resolves, the paths are constants. Every variable any platform consults for
+ * "home" or "app data" is swapped, or a Windows or Linux run would quietly read the real machine.
+ */
+const HOME_VARS = ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME']
+
+async function fakeClaude() {
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'claude-fixture-'))
+  const saved = Object.fromEntries(HOME_VARS.map((k) => [k, process.env[k]]))
+  Object.assign(process.env, {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: path.join(home, 'AppData', 'Roaming'),
+    LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+  })
+  try {
+    const h = (await import(`../server/harnesses/claude-code.mjs?${home}`)).default
+    return { h, cleanup: () => fsp.rm(home, { recursive: true, force: true }) }
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
+/** A transcript where the CLI would put it: under a folder named after its cwd, encoded. */
+async function writeTranscript(h, cwd, id, records) {
+  const folder = path.join(h.paths.CLI_PROJECTS, cwd.replace(/[^a-zA-Z0-9]/g, '-'))
+  await fsp.mkdir(folder, { recursive: true })
+  const file = path.join(folder, `${id}.jsonl`)
+  await fsp.writeFile(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  return file
+}
+
+/** One desktop-app session record: `claude-code-sessions/<account>/<org>/local_*.json`. */
+async function writeDesktopRecord(h, record) {
+  const org = path.join(h.paths.DESKTOP_SESSIONS, 'account', 'org')
+  await fsp.mkdir(org, { recursive: true })
+  await fsp.writeFile(path.join(org, `${record.sessionId}.json`), JSON.stringify(record))
+}
+
+/** A live-process registry entry, for a pid that is — by default — this very test process. */
+async function markLive(h, sessionId, pid = process.pid) {
+  await fsp.mkdir(h.paths.CLI_LIVE, { recursive: true })
+  await fsp.writeFile(path.join(h.paths.CLI_LIVE, `${sessionId}.json`), JSON.stringify({ pid, sessionId }))
+}
+
+const userSays = (text, fields) => ({
+  type: 'user', uuid: randomUUID(), parentUuid: null, message: { role: 'user', content: text }, ...fields,
+})
+const answers = (fields, content = [{ type: 'text', text: 'done' }]) => ({
+  type: 'assistant', uuid: randomUUID(), message: { role: 'assistant', content, stop_reason: 'end_turn' }, ...fields,
+})
+const desktopId = () => `local_${randomUUID()}`
+
+// A space, a trailing space and a hyphen: everything the folder-name encoding flattens.
+const REPO = '/Volumes/Work Drive /Clients/my-repo'
+
+test('a transcript whose first record outgrows the head still lands in its own repo and worktree', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = `${REPO}/.claude/worktrees/phase-2`
+    const id = randomUUID()
+    // The shape an SDK session handed a whole document takes: the prompt, twice, before any cwd.
+    const prompt = 'p'.repeat(200 * 1024)
+    await writeTranscript(h, cwd, id, [
+      { type: 'queue-operation', operation: 'enqueue', timestamp: ago(2 * MINUTE), sessionId: id, content: prompt },
+      userSays(prompt, { sessionId: id, cwd, timestamp: ago(2 * MINUTE) }),
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.project, 'my-repo')
+    assert.equal(t.projectPath, REPO)
+    assert.equal(t.worktree, 'phase-2')
+    assert.equal(t.cwd, cwd)
+    assert.ok(t.title.length <= 300, `a pasted prompt makes a title, not a ${t.title.length}-character one`)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a transcript that never names its cwd borrows one that encodes to its folder, and never guesses', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const sibling = randomUUID()
+    await writeTranscript(h, REPO, sibling, [userSays('hi', { sessionId: sibling, cwd: REPO, timestamp: ago(HOUR) })])
+    // No record in either of these carries a cwd at all.
+    const orphan = randomUUID()
+    await writeTranscript(h, `${REPO}/.claude/worktrees/wt-a`, orphan, [{ type: 'summary', summary: 'lost one' }])
+    const stray = randomUUID()
+    await writeTranscript(h, '/nowhere/at-all', stray, [{ type: 'summary', summary: 'stray' }])
+
+    const byId = Object.fromEntries((await h.scanThreads()).map((t) => [t.id, t]))
+    const o = byId[`claude-code:${orphan}`]
+    assert.equal(o.project, 'my-repo')
+    assert.equal(o.projectPath, REPO)
+    assert.equal(o.worktree, 'wt-a')
+    assert.equal(byId[`claude-code:${stray}`].projectPath, '', 'no folder is better than a made-up one')
+  } finally {
+    await cleanup()
+  }
 })

@@ -17,7 +17,9 @@ import fsp from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import {
+  exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readRecordsUntil, readTail,
+} from '../lib/fsutil.mjs'
 
 const HOME = os.homedir()
 
@@ -81,6 +83,17 @@ const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
 const HEAD_BYTES = 192 * 1024
 
 /**
+ * How far to read for a transcript's opening when the head cannot show it. A pasted prompt of a
+ * couple of hundred thousand characters — an SDK session handed a whole document — is written
+ * twice before any record carries a cwd, which puts the first one half a megabyte in. Bounded,
+ * and paid once per session rather than once per poll: see `openingMeta`.
+ */
+const OPENING_BYTES = 2 * 1024 * 1024
+
+/** The most of a first prompt kept. It stands in for a title and a preview, never for the prompt. */
+const PROMPT_CHARS = 300
+
+/**
  * How recently a session must have done something to count as "active now".
  * A live process on its own is not enough: the desktop app pre-warms idle sessions, so
  * threads untouched for days still hold a CLI process. Measured against real data, the
@@ -139,7 +152,7 @@ function readTranscriptMeta(records) {
     }
     if (!meta.firstPrompt && r.type === 'user' && r.message) {
       const text = cleanPrompt(firstText(r.message.content))
-      if (text && !text.startsWith('<')) meta.firstPrompt = text
+      if (text && !text.startsWith('<')) meta.firstPrompt = text.slice(0, PROMPT_CHARS)
     }
   }
   return meta
@@ -163,13 +176,43 @@ function projectOf(cwd, originCwd) {
 }
 
 /**
- * Best-effort reverse of the encoding used for project folder names: `-Users-you-Some-Dir`
- * on macOS, `C--Users-you-Some-Dir` on Windows, where the drive's colon became a dash too.
+ * The CLI names a transcript's folder after the cwd it ran in, with every character outside
+ * [A-Za-z0-9] turned into `-`. That cannot be reversed — `/`, ` `, `.`, `_` and `-` all land on the
+ * same character — so a folder name is only ever checked against a real path, never decoded into
+ * one. Decoding it split `my-repo` on a drive called `Work Drive` into four made-up folders, and
+ * the thread claimed a zone of its own named after the last of them.
  */
-function decodeProjectDir(name) {
-  const drive = /^([A-Za-z])--(.*)$/.exec(name)
-  if (drive) return `${drive[1]}:\\${drive[2].replace(/-/g, '\\')}`
-  return name.startsWith('-') ? '/' + name.slice(1).replace(/-/g, '/') : name
+const encodeProjectDir = (p) => String(p).replace(/[^a-zA-Z0-9]/g, '-')
+
+/** What `/.claude/worktrees/` becomes in a folder name, on either separator. */
+const WORKTREE_MARK = '--claude-worktrees-'
+
+/**
+ * The cwd a transcript folder stands for, for the rare transcript that never says where it ran.
+ *
+ * Only paths something on this machine actually reported are candidates — another transcript's
+ * cwd, a desktop record's — and one is taken only if it encodes back to exactly this folder's
+ * name. A worktree's folder is the one case that can be built rather than found: its repo's path,
+ * which a sibling usually knows, plus the worktree's name, which the marker leaves readable. That
+ * name is best-effort (it went through the same lossy encoding) but it only labels the worktree;
+ * the repo, and so the zone, is exact.
+ *
+ * Nothing found is an honest answer: `''` leaves the thread with no folder rather than a made-up
+ * one, and the HUD greys out the folder buttons for it.
+ */
+function resolveProjectDir(name, known) {
+  if (known.has(name)) return known.get(name)
+  const mark = name.lastIndexOf(WORKTREE_MARK)
+  if (mark > 0) {
+    const root = known.get(name.slice(0, mark))
+    if (root) {
+      // Joined in the root's own separator, so the repo half comes back as exactly the string a
+      // sibling reported — which is what the zone is keyed on.
+      const sep = root.includes('\\') && !root.includes('/') ? '\\' : '/'
+      return [root, '.claude', 'worktrees', name.slice(mark + WORKTREE_MARK.length)].join(sep)
+    }
+  }
+  return ''
 }
 
 /** Index every CLI transcript on disk, keyed by session id. */
@@ -239,7 +282,37 @@ async function transcriptMeta(entry) {
   } catch {
     meta = readTranscriptMeta([])
   }
+  // No cwd in a head shorter than the file is a head that ran out before the transcript said
+  // where it was — not a transcript that never says.
+  if (!meta.cwd && entry.size > HEAD_BYTES) meta = await openingMeta(entry)
   metaCache.set(entry.id, { mtime: entry.mtime, meta })
+  return meta
+}
+
+/**
+ * Metadata for a transcript whose first cwd lies past the head, read forward until it appears.
+ *
+ * `readHead` has to drop a trailing partial line, and a first record longer than the whole head
+ * leaves it nothing at all — so the cwd, the start time and the first prompt went missing together,
+ * and the thread fell through to guessing its folder from the folder's name.
+ *
+ * Everything up to the first cwd is written once and never changes, so once found it is kept
+ * against the session alone. Keyed on mtime like the head, a live transcript with a giant first
+ * record would re-read half a megabyte on every poll it moved.
+ */
+const openingCache = new Map()
+async function openingMeta(entry) {
+  const known = openingCache.get(entry.id)
+  if (known) return known
+  let meta
+  try {
+    meta = readTranscriptMeta(
+      await readRecordsUntil(entry.file, { maxBytes: OPENING_BYTES, until: (r) => Boolean(r.cwd) })
+    )
+  } catch {
+    meta = readTranscriptMeta([])
+  }
+  if (meta.cwd) openingCache.set(entry.id, meta)
   return meta
 }
 
@@ -352,6 +425,18 @@ async function scanThreads() {
   }
   const claimed = new Set()
 
+  /**
+   * Every path this machine has reported, keyed by the name the CLI would give its transcript
+   * folder — what a transcript that never states its own cwd is resolved against. First report
+   * wins, so two paths that happen to encode alike cannot trade places between polls.
+   */
+  const known = new Map()
+  const learn = (p) => {
+    if (typeof p !== 'string' || !p) return
+    const name = encodeProjectDir(p)
+    if (!known.has(name)) known.set(name, p)
+  }
+
   for (const s of desktop) {
     const cliSessionId = s.cliSessionId || ''
     const entry = cliSessionId ? transcripts.get(cliSessionId) : null
@@ -360,6 +445,9 @@ async function scanThreads() {
     const cwd = s.cwd || s.originCwd || ''
     const { projectPath, project, worktree } = projectOf(cwd, s.originCwd)
     const meta = entry ? await transcriptMeta(entry) : null
+    learn(s.cwd)
+    learn(s.originCwd)
+    learn(meta?.cwd)
 
     add({
       id: ID(cliSessionId || s.sessionId),
@@ -404,10 +492,18 @@ async function scanThreads() {
   }
 
   // Transcripts with no desktop record — usually threads started straight from the terminal.
+  // All of them are read first (cached, so free after the first poll), so that every path they
+  // report is known before any one of them needs a folder resolved.
+  const loose = []
   for (const [id, entry] of transcripts) {
     if (claimed.has(id)) continue
     const meta = await transcriptMeta(entry)
-    const cwd = meta.cwd || decodeProjectDir(path.basename(entry.projectDir))
+    learn(meta.cwd)
+    loose.push({ id, entry, meta })
+  }
+
+  for (const { id, entry, meta } of loose) {
+    const cwd = meta.cwd || resolveProjectDir(path.basename(entry.projectDir), known)
     const { projectPath, project, worktree } = projectOf(cwd, '')
     add({
       id: ID(id),
