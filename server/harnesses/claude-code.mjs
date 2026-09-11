@@ -110,6 +110,9 @@ const ACTIVE_WINDOW_MS = 30 * 60 * 1000
  */
 const NEVER_FOCUSED_MS = 3 * 24 * 60 * 60 * 1000
 
+/** How close a desktop thread's creation and a transcript's first record must be to be one event. */
+const SAME_MOMENT_MS = 60 * 1000
+
 /**
  * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
  * across harnesses, and while two UUIDs will not collide, the colony keys its archive list and
@@ -148,7 +151,9 @@ function cleanPrompt(s) {
  * Mirrors the CLI's own title precedence: custom > ai > summary > first prompt.
  */
 function readTranscriptMeta(records) {
-  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0 }
+  const meta = {
+    customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0, rootUuid: '',
+  }
   for (const r of records) {
     if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
     if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
@@ -162,6 +167,11 @@ function readTranscriptMeta(records) {
     if (!meta.firstPrompt && r.type === 'user' && r.message) {
       const text = cleanPrompt(firstText(r.message.content))
       if (text && !text.startsWith('<')) meta.firstPrompt = text.slice(0, PROMPT_CHARS)
+    }
+    // The conversation's first message, by its own id. A transcript the desktop app copied or
+    // imported keeps the ids of the records it copied, so two files sharing this share a conversation.
+    if (!meta.rootUuid && r.type === 'user' && typeof r.uuid === 'string' && r.parentUuid == null) {
+      meta.rootUuid = r.uuid
     }
   }
   return meta
@@ -338,7 +348,9 @@ async function openingMeta(entry) {
  * a session that moved into a worktree is on the worktree's branch now, not the one it began on.
  */
 function readTranscriptTail(records) {
-  const tail = { lastRecordAt: 0, relocatedCwd: '', gitBranch: '', customTitle: '', aiTitle: '' }
+  const tail = {
+    lastRecordAt: 0, relocatedCwd: '', gitBranch: '', customTitle: '', aiTitle: '', endsInSession: '',
+  }
   for (const r of records) {
     const t = r.timestamp ? Date.parse(r.timestamp) : NaN
     if (!Number.isNaN(t) && t > tail.lastRecordAt) tail.lastRecordAt = t
@@ -346,6 +358,10 @@ function readTranscriptTail(records) {
     if (r.gitBranch && r.gitBranch !== 'HEAD') tail.gitBranch = r.gitBranch
     if (r.customTitle) tail.customTitle = r.customTitle
     if (r.aiTitle) tail.aiTitle = r.aiTitle
+    // Whose conversation the file ends in. A copy keeps the session ids of the records it copied.
+    if ((r.type === 'user' || r.type === 'assistant') && typeof r.sessionId === 'string') {
+      tail.endsInSession = r.sessionId
+    }
   }
   return tail
 }
@@ -481,6 +497,31 @@ function toThread(t) {
   }
 }
 
+/**
+ * The thread a terminal-only transcript is really a copy of, or `''`.
+ *
+ * Importing or forking in the desktop app writes a fresh transcript under a new session id and
+ * leaves the source file behind, and nothing links the two. Left alone each becomes an astronaut:
+ * the same conversation, twice, on the same plot. Two shapes are folded, both conservatively:
+ *
+ *   - **A copy.** Its conversation ends in another session's records — the ids came along with the
+ *     history — and that session's transcript is on disk. It is that thread.
+ *   - **A superseded original.** It began the conversation a desktop thread was opened on, at the
+ *     moment that thread was created, and wrote nothing after that thread last did. Whatever it
+ *     holds beyond the copy is a turn somebody rewound, not a thread anybody is working in.
+ *
+ * A transcript that did anything after its would-be owner is a continuation, and stays.
+ */
+function supersededBy(id, entry, meta, tail, transcripts, rootOwners) {
+  const other = tail.endsInSession
+  if (other && other !== id && transcripts.has(other)) return ID(other)
+  for (const owner of rootOwners.get(meta.rootUuid) || []) {
+    const sameMoment = Math.abs(owner.createdAt - meta.startedAt) <= SAME_MOMENT_MS
+    if (sameMoment && activityOf(entry, tail) <= owner.lastActivityAt) return owner.id
+  }
+  return ''
+}
+
 async function scanThreads() {
   const [desktop, transcripts, live] = await Promise.all([
     scanDesktopSessions(),
@@ -505,6 +546,8 @@ async function scanThreads() {
     const name = encodeProjectDir(p)
     if (!known.has(name)) known.set(name, p)
   }
+  /** Which desktop thread began each conversation — the one the app opened on it, never a fork. */
+  const rootOwners = new Map()
 
   for (const s of desktop) {
     const cliSessionId = s.cliSessionId || ''
@@ -519,6 +562,19 @@ async function scanThreads() {
     learn(s.originCwd)
     learn(meta?.cwd)
     learn(tail?.relocatedCwd)
+
+    // The desktop record's own stamp lags: the app writes it when the thread is focused, so a
+    // session running in a terminal — or in a window you are not looking at — reads as hours
+    // old while its transcript is being written to right now. The later of the two is true.
+    const lastActivityAt = Math.max(
+      num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
+      entry ? activityOf(entry, tail) : 0
+    )
+    if (meta?.rootUuid && !s.forkedFromSessionId) {
+      const owners = rootOwners.get(meta.rootUuid) || []
+      owners.push({ id: ID(cliSessionId || s.sessionId), createdAt: num(s.createdAt), lastActivityAt })
+      rootOwners.set(meta.rootUuid, owners)
+    }
 
     add({
       id: ID(cliSessionId || s.sessionId),
@@ -537,13 +593,7 @@ async function scanThreads() {
       model: s.model || '',
       effort: s.effort || '',
       createdAt: num(s.createdAt) || meta?.startedAt || 0,
-      // The desktop record's own stamp lags: the app writes it when the thread is focused, so a
-      // session running in a terminal — or in a window you are not looking at — reads as hours
-      // old while its transcript is being written to right now. The later of the two is true.
-      lastActivityAt: Math.max(
-        num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
-        entry ? activityOf(entry, tail) : 0
-      ),
+      lastActivityAt,
       // Kept apart from the above. "Unread" compares against when you last *looked*, and both
       // sides have to come from the app's own bookkeeping: measure a transcript mtime against
       // `lastFocusedAt` instead and every background write puts a `?` over half the colony.
@@ -577,6 +627,7 @@ async function scanThreads() {
   }
 
   for (const { id, entry, meta, tail } of loose) {
+    if (supersededBy(id, entry, meta, tail, transcripts, rootOwners)) continue
     const cwd = whereItRuns(path.basename(entry.projectDir), meta, tail, known)
     const { projectPath, project, worktree } = projectOf(cwd, '')
     add({

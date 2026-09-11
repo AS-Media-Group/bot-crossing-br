@@ -450,3 +450,63 @@ test('a desktop record from before focus was tracked is not a thread that was ne
     await cleanup()
   }
 })
+
+test("a copy of a desktop thread's transcript is that thread, not a second astronaut", async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const sid = randomUUID()
+    const copy = randomUUID()
+    const convo = [
+      userSays('hello', { sessionId: sid, cwd, timestamp: ago(2 * HOUR) }),
+      answers({ sessionId: sid, cwd, timestamp: ago(2 * HOUR - MINUTE) }),
+    ]
+    await writeTranscript(h, cwd, sid, convo)
+    // A fork or import: the same records, the same session ids, and the app's own title on the end.
+    await writeTranscript(h, cwd, copy, [...convo, { type: 'custom-title', customTitle: 'copy', sessionId: copy }])
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: sid, cwd, title: 'the thread',
+      createdAt: Date.now() - 2 * HOUR, lastActivityAt: Date.now() - 2 * HOUR, lastFocusedAt: Date.now(),
+    })
+    assert.deepEqual((await h.scanThreads()).map((t) => t.id), [`claude-code:${sid}`])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a transcript the desktop app superseded is folded, but one that carried on after it is not', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const cwd = '/tmp/demo'
+    const began = Date.now() - 3 * HOUR
+    const root = randomUUID()
+    const original = randomUUID()
+    const current = randomUUID()
+    const diverged = randomUUID()
+    const opening = (sessionId) => userSays('start', { uuid: root, sessionId, cwd, timestamp: new Date(began).toISOString() })
+    // The file the thread began in, left behind when the app moved the conversation on.
+    await writeTranscript(h, cwd, original, [
+      opening(original),
+      answers({ sessionId: original, cwd, timestamp: new Date(began + MINUTE).toISOString() }),
+    ])
+    // The transcript the desktop record points at now: the same opening, then more.
+    await writeTranscript(h, cwd, current, [
+      opening(original),
+      userSays('more', { sessionId: current, cwd, parentUuid: root, timestamp: new Date(began + 10 * MINUTE).toISOString() }),
+      answers({ sessionId: current, cwd, timestamp: new Date(began + 11 * MINUTE).toISOString() }),
+    ])
+    // Same opening, but it did something after the thread's last activity: a continuation.
+    await writeTranscript(h, cwd, diverged, [
+      opening(diverged),
+      answers({ sessionId: diverged, cwd, timestamp: new Date(began + 20 * MINUTE).toISOString() }),
+    ])
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: current, cwd, title: 'the thread',
+      createdAt: began, lastActivityAt: began + 11 * MINUTE, lastFocusedAt: Date.now(),
+    })
+    const ids = (await h.scanThreads()).map((t) => t.id).sort()
+    assert.deepEqual(ids, [`claude-code:${current}`, `claude-code:${diverged}`].sort())
+  } finally {
+    await cleanup()
+  }
+})
