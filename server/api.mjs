@@ -63,23 +63,40 @@ const emptyState = () => ({
 const asObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {})
 const asArray = (v) => (Array.isArray(v) ? v : [])
 
+/**
+ * The colony file is there but cannot be used — unreadable, not JSON, or its folder has gone.
+ *
+ * Kept apart from "no file yet" on purpose. That one is a fresh colony; this one is somebody's
+ * colony we cannot see. Answering both with an empty state is what let the next save — whose base
+ * the empty answer had just set to zero — overwrite a perfectly good file with nothing.
+ */
+class StorageUnavailable extends Error {}
+
 async function readState() {
+  let text
   try {
-    const raw = migrate(JSON.parse(await fsp.readFile(STATE_FILE, 'utf8')))
-    return {
-      version: STATE_VERSION,
-      archived: asArray(raw.archived),
-      archivedAt: asObject(raw.archivedAt),
-      opened: asArray(raw.opened),
-      plots: asObject(raw.plots),
-      seen: asObject(raw.seen),
-      hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
-      viewedAt: asObject(raw.viewedAt),
-      settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
-      updatedAt: Number(raw.updatedAt) || 0,
-    }
+    text = await fsp.readFile(STATE_FILE, 'utf8')
+  } catch (err) {
+    if (err?.code === 'ENOENT') return emptyState()
+    throw new StorageUnavailable(`Cannot read ${STATE_FILE} (${err?.code || err}); it has been left as it is`)
+  }
+  let raw
+  try {
+    raw = migrate(JSON.parse(text))
   } catch {
-    return emptyState()
+    throw new StorageUnavailable(`${STATE_FILE} is not valid JSON; it has been left as it is — fix or move it`)
+  }
+  return {
+    version: STATE_VERSION,
+    archived: asArray(raw.archived),
+    archivedAt: asObject(raw.archivedAt),
+    opened: asArray(raw.opened),
+    plots: asObject(raw.plots),
+    seen: asObject(raw.seen),
+    hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
+    viewedAt: asObject(raw.viewedAt),
+    settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
+    updatedAt: Number(raw.updatedAt) || 0,
   }
 }
 
@@ -113,14 +130,21 @@ async function writeState(next) {
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
     updatedAt: Date.now(),
   }
-  await fsp.mkdir(DATA_DIR, { recursive: true })
+  // Not recursive, on purpose: the data folder may be created, but its parent must already be
+  // there. A drive that has gone, or a repo moved while the server runs, then fails loudly here —
+  // rather than quietly growing a fresh, empty colony somewhere nobody will ever look.
+  await fsp.mkdir(DATA_DIR).catch((err) => {
+    if (err.code !== 'EEXIST') {
+      throw new StorageUnavailable(`Cannot use ${DATA_DIR} (${err.code}); its parent folder has to exist`)
+    }
+  })
   const tmp = `${STATE_FILE}.${process.pid}.${++tmpSeq}.tmp`
   try {
     await fsp.writeFile(tmp, JSON.stringify(state, null, 2))
     await fsp.rename(tmp, STATE_FILE)
   } catch (err) {
     await fsp.rm(tmp, { force: true }).catch(() => {})
-    throw err
+    throw new StorageUnavailable(`Cannot write ${STATE_FILE} (${err.code || err})`)
   }
   return state
 }
@@ -268,7 +292,14 @@ async function present(result) {
  * colony's own business. Nothing outside `data/colony.json` is ever written.
  */
 async function reconcileArchived(threads) {
-  const state = await readState()
+  let state
+  try {
+    state = await readState()
+  } catch {
+    // A colony file that cannot be read says nothing about what is archived. The map still draws;
+    // the archive list comes back when the file does.
+    return threads
+  }
   if (!state.archived.length) return threads
   const wanted = new Set(state.archived)
 
@@ -448,8 +479,11 @@ export async function apiMiddleware(req, res, next) {
      * a base newer than disk, which sails through a greater-than check and pastes the
      * pre-restore colony straight back.
      *
-     * A missing or zero base is a first write and is allowed: nothing to lose on a fresh
-     * install, and it keeps the endpoint drivable from `curl`.
+     * A zero base is a first write, allowed only while there is nothing on disk to lose — a fresh
+     * install, or `curl` against one. Against a real colony it gets the disk state back to merge,
+     * like any stale save. A base with no file behind it at all is a colony that has gone (the
+     * file, or the drive under it), and gets a 503: starting a new one from the page's copy would
+     * bury the real one the moment it came back.
      */
     if (url.pathname === '/api/state' && req.method === 'PUT') {
       const body = await readJsonBody(req)
@@ -458,7 +492,10 @@ export async function apiMiddleware(req, res, next) {
       // exited, so a failed write escaped the catch below and took the whole server down with it.
       return await serialise(async () => {
         const current = await readState()
-        if (base && current.updatedAt !== base) return send(res, 409, current)
+        if (base && !current.updatedAt) {
+          return send(res, 503, { error: 'The colony file has gone; not starting a new one over it' })
+        }
+        if (current.updatedAt !== base) return send(res, 409, current)
         return send(res, 200, await writeState(body))
       })
     }
@@ -487,6 +524,9 @@ export async function apiMiddleware(req, res, next) {
 
     return send(res, 404, { error: 'Unknown endpoint' })
   } catch (err) {
+    // Storage the server cannot use is its own answer: the page keeps what it holds and tries
+    // again later, rather than treating the colony as empty.
+    if (err instanceof StorageUnavailable) return send(res, 503, { error: err.message })
     return send(res, 500, { error: String(err && err.message ? err.message : err) })
   }
 }

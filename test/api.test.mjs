@@ -122,3 +122,93 @@ test('a colony write that fails is an error reply, not a crashed server', async 
   const res = await call(api, 'PUT', '/api/state', { body: { archived: ['x'] } })
   assert.ok(res.status >= 500 && res.status < 600, `got ${res.status}`)
 })
+
+test('a colony file that is not valid JSON is reported, and never replaced', async () => {
+  const dir = await scratch('data')
+  const file = path.join(dir, 'colony.json')
+  const typo = '{"version":2,"archived":["claude-code:a"],"plots":{"p":[[0,0]]},"updatedAt":1000,}'
+  await fsp.writeFile(file, typo)
+  const api = await apiWith(dir)
+  assert.equal((await call(api, 'GET', '/api/state')).status, 503)
+  assert.equal((await call(api, 'PUT', '/api/state', { body: { archived: [] } })).status, 503)
+  assert.equal((await call(api, 'PUT', '/api/state', { body: { archived: [], baseUpdatedAt: 1000 } })).status, 503)
+  assert.equal(await fsp.readFile(file, 'utf8'), typo, 'the file is exactly as it was')
+})
+
+test(
+  'an unreadable colony file is reported, and never replaced',
+  { skip: process.platform === 'win32' || process.getuid?.() === 0 },
+  async () => {
+    const dir = await scratch('data')
+    const file = path.join(dir, 'colony.json')
+    const good = JSON.stringify({ version: 2, archived: ['claude-code:a'], updatedAt: 1000 })
+    await fsp.writeFile(file, good)
+    await fsp.chmod(file, 0o000)
+    try {
+      const api = await apiWith(dir)
+      assert.equal((await call(api, 'GET', '/api/state')).status, 503)
+      assert.equal((await call(api, 'PUT', '/api/state', { body: { archived: [] } })).status, 503)
+    } finally {
+      await fsp.chmod(file, 0o644)
+    }
+    assert.equal(await fsp.readFile(file, 'utf8'), good)
+  }
+)
+
+test('a save against a colony file that has vanished does not start a new one', async () => {
+  const dir = await scratch('data')
+  const api = await apiWith(dir)
+  const res = await call(api, 'PUT', '/api/state', { body: { archived: ['x'], baseUpdatedAt: 12345 } })
+  assert.equal(res.status, 503)
+  await assert.rejects(fsp.access(path.join(dir, 'colony.json')), 'nothing was written')
+})
+
+test('a first save against a real colony it never saw gets the disk state back, to merge', async () => {
+  const dir = await scratch('data')
+  await fsp.writeFile(path.join(dir, 'colony.json'), JSON.stringify({ version: 2, archived: ['claude-code:a'], updatedAt: 1000 }))
+  const api = await apiWith(dir)
+  const res = await call(api, 'PUT', '/api/state', { body: { archived: [] } })
+  assert.equal(res.status, 409)
+  assert.deepEqual(res.json.archived, ['claude-code:a'])
+})
+
+test('a data folder whose parent has gone is not quietly re-created', async () => {
+  const root = await scratch('gone')
+  const api = await apiWith(path.join(root, 'unmounted-drive', 'data'))
+  assert.equal((await call(api, 'PUT', '/api/state', { body: { archived: ['x'] } })).status, 503)
+  await assert.rejects(fsp.access(path.join(root, 'unmounted-drive')))
+})
+
+test('the thread list still answers when the colony file cannot be read', async () => {
+  // Passes before this task too; it guards the new throw in readState from reaching /api/threads.
+  const dir = await scratch('data')
+  await fsp.writeFile(path.join(dir, 'colony.json'), '{ not json')
+  const api = await apiWith(dir)
+  const res = await call(api, 'GET', '/api/threads')
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.json.threads, [])
+})
+
+test('a page will not merge an empty colony over the one it holds', async () => {
+  const disk = {
+    version: 2, archived: ['claude-code:a'], archivedAt: {}, opened: [], plots: { p: [[0, 0]] },
+    seen: {}, hiddenProjects: [], viewedAt: {}, settings: null, updatedAt: 1000,
+  }
+  const emptied = { ...disk, archived: [], plots: {}, updatedAt: 0 }
+  const realFetch = globalThis.fetch
+  let puts = 0
+  globalThis.fetch = async (_url, opts = {}) => {
+    const answer = (status, body) => ({ ok: status < 300, status, statusText: '', json: async () => body })
+    if ((opts.method || 'GET') === 'GET') return answer(200, disk)
+    puts += 1
+    return answer(409, emptied)
+  }
+  try {
+    const { fetchState, saveState } = await import('../src/game/api.js')
+    const state = await fetchState()
+    await assert.rejects(saveState({ ...state, seen: { t: 1 } }))
+    assert.equal(puts, 1, 'no second attempt, built on the empty colony')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

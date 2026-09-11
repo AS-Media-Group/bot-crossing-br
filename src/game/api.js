@@ -66,6 +66,12 @@ export async function saveState(state) {
     const body = await res.json().catch(() => ({}))
 
     if (res.status === 409) {
+      // A conflict that hands back a colony with no version, while this tab holds a versioned one,
+      // is not another tab's work — it is a disk that went backwards to nothing. Merging it would
+      // count everything this tab holds as deleted on the other side, and write that down.
+      if (baseUpdatedAt && !Number(body.updatedAt)) {
+        throw new Error('The colony file came back empty; not saving over it')
+      }
       local = mergeState(baseSnapshot, local, body)
       adoptBase(body)
       continue
