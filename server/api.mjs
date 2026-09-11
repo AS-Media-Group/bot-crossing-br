@@ -454,7 +454,9 @@ export async function apiMiddleware(req, res, next) {
     if (url.pathname === '/api/state' && req.method === 'PUT') {
       const body = await readJsonBody(req)
       const base = Number(body.baseUpdatedAt) || 0
-      return serialise(async () => {
+      // Awaited, not returned: a bare `return` settles the handler after the try block has already
+      // exited, so a failed write escaped the catch below and took the whole server down with it.
+      return await serialise(async () => {
         const current = await readState()
         if (base && current.updatedAt !== base) return send(res, 409, current)
         return send(res, 200, await writeState(body))

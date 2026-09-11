@@ -110,3 +110,15 @@ test('reveal and new session refuse a folder no thread ever ran in', { skip: pro
   await delay(200) // the opener is spawned detached; give a mistaken one time to write its log
   assert.deepEqual(await opener.opened(), [], 'nothing was handed to the opener')
 })
+
+// ── what it does when the disk misbehaves ─────────────────────────────────────
+
+test('a colony write that fails is an error reply, not a crashed server', async () => {
+  const dir = await scratch('notadir')
+  const file = path.join(dir, 'notadir')
+  await fsp.writeFile(file, 'a regular file where a folder should be')
+  // ENOTDIR on the way to the data folder — much how a drive that has gone away fails.
+  const api = await apiWith(path.join(file, 'data'))
+  const res = await call(api, 'PUT', '/api/state', { body: { archived: ['x'] } })
+  assert.ok(res.status >= 500 && res.status < 600, `got ${res.status}`)
+})
