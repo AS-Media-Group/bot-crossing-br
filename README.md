@@ -182,7 +182,9 @@ into the same repo. Picking somebody is also picking the zone they are standing 
   `claude://code/new?folder=…` deep link Finder's "New Claude Code Session Here" quick
   action uses, so the desktop app opens an empty session with the repo as its workspace —
   nothing is resumed and nothing is written.
-- **Finder** (Explorer on Windows) opens the folder, **Copy path** copies it.
+- **Finder** (Explorer on Windows) opens the folder, **Copy path** copies it. Both folder
+  actions only ever act on a folder a scanned thread actually ran in — anything else is
+  refused, because `open` would happily launch an app bundle it was handed.
 - Underneath, everything running in that repo, whoever wants something first. Clicking one
   flies to its astronaut and selects it.
 
@@ -221,15 +223,12 @@ thread it already has. `claude://resume` is the fallback for threads that only e
 transcript: it *imports* the transcript, which creates a second untitled session and rewrites
 the `.jsonl`, so it is only ever used when there is nothing to navigate to.
 
-Archiving carries a deliberate one-writer discipline: the browser owns
-`data/colony.json` and PUTs it whole, `/api/archive` only touches Claude Code's records. If
-both wrote it, a save from a page holding older state would silently drop every archive made
-since that page loaded. Claude Code also rewrites its session records from memory and can
-stomp the flag, so the colony re-asserts it on every scan — an archive that gets stomped comes
-back within one poll.
+Archiving carries a deliberate one-writer discipline: the browser owns `data/colony.json` and
+PUTs it whole, and nothing else writes it. If anything did, a save from a page holding older
+state would silently drop every archive made since that page loaded.
 
-Nothing is ever written to your Claude Code data except that one `isArchived` field. The
-folder buttons only ever hand a path to `open`.
+Nothing is ever written to your Claude Code data. The folder buttons only ever hand `open` a
+path a scanned thread reported.
 
 The deep links above are the **Claude Code adapter's** business, not the colony's — another
 harness plugs its own in, and a harness with no deep link simply greys the button out. See
@@ -582,14 +581,20 @@ more interesting target than a localhost toy usually is. Three things hold it in
   a domain they control at `127.0.0.1` — DNS rebinding — reaches the server *as a same-origin
   page* and can then read every reply. Those requests still arrive carrying
   `Host: their-domain`, and are refused.
-- **It checks `Origin`.** A cross-site `fetch` with a `text/plain` body is not preflighted, so
-  without this any page you happened to have open could POST here — spawning sessions, opening
-  Finder windows, or overwriting the colony layout — even while unable to read the response.
-  Requests from anywhere but this server's own page are refused.
+- **It checks `Origin`, port and all.** A cross-site `fetch` with a `text/plain` body is not
+  preflighted, so without this any page you happened to have open could POST here — spawning
+  sessions, opening Finder windows, or overwriting the colony layout — even while unable to
+  read the response. The Origin has to name this exact server: every other page on localhost
+  shares its hostname, so a check on the hostname alone let another local dev server read every
+  thread on the machine. A request the browser marks `Sec-Fetch-Site: same-site` is refused
+  for the same reason, and the dev server grants no CORS to anyone.
 
 The practical cost: a bare `curl` POST is refused too, since browsers always send `Origin` on
-POST and its absence means the caller is not the page. Add `-H 'Origin: http://localhost:5274'`
-if you are scripting against the API.
+POST and its absence means the caller is not the page. Add an `Origin` naming the URL you are
+calling — `-H 'Origin: http://localhost:5274'` against `http://localhost:5274`, `127.0.0.1`
+against `127.0.0.1` — if you are scripting against the API. A first save with no
+`baseUpdatedAt` is only accepted while there is no colony on disk yet; against a real one it
+gets the disk state back, to merge, like any stale save.
 
 ### Serving it to your network
 
@@ -599,6 +604,9 @@ tablet on the sofa:
 ```bash
 BOT_CROSSING_HOST=0.0.0.0 npm start
 ```
+
+Only then are this machine's own LAN addresses accepted as a `Host`; bound to loopback they are
+refused, so a page served from the LAN address by something else cannot pass as the colony.
 
 **Understand what that hands out before you do it.** The two checks above stop a *web page* from
 driving the server; they are not access control, and they do nothing about another device asking
@@ -615,11 +623,17 @@ What it touches on disk, in full:
 | | |
 | --- | --- |
 | Reads | Your harness's own session records and transcripts |
-| Writes | `data/colony.json`, and **one** `isArchived` field per archived thread |
+| Writes | `data/colony.json` — or `$BOT_CROSSING_DATA/colony.json` — and nothing else |
 | Sends | Nothing. No network calls, no telemetry, no account |
 
 `data/colony.json` holds the names and paths of the repos you work in, so it is gitignored —
 worth knowing before you copy one into an issue.
+
+`BOT_CROSSING_DATA` moves it: point it at a folder whose parent already exists (the folder
+itself is created, its parent never is — a drive that has gone away fails loudly rather than
+growing a fresh, empty colony somewhere nobody looks). A colony file the server cannot read —
+unreadable, or not valid JSON after a hand edit — is reported with a 503 and left exactly as it
+is; it is never answered as an empty colony and saved over.
 
 ## Layout
 
@@ -630,8 +644,8 @@ server/
     claude-code.mjs
   lib/         filesystem helpers the adapters share
   scan.mjs     harness-agnostic: asks every detected harness, merges, sorts
-  api.mjs      /api/threads, /api/harnesses, /api/state, /api/open, /api/archive,
-               /api/new-session, /api/reveal
+  api.mjs      /api/threads, /api/harnesses, /api/state, /api/open, /api/new-session,
+               /api/reveal
   serve.mjs    static server for the built app
 src/
   core/        settings, renderer + post chain, the Google Earth camera
