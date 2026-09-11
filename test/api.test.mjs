@@ -24,6 +24,7 @@ process.env.LOCALAPPDATA = path.join(EMPTY_HOME, 'AppData', 'Local')
 process.env.XDG_CONFIG_HOME = path.join(EMPTY_HOME, '.config')
 delete process.env.CODEX_HOME
 delete process.env.BOT_CROSSING_CURSOR_PROJECTS
+delete process.env.BOT_CROSSING_COWORK_SESSIONS
 delete process.env.BOT_CROSSING_HOST
 
 async function apiWith(dataDir) {

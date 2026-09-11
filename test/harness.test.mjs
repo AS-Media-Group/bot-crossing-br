@@ -723,3 +723,105 @@ test("a new conversation's folder is %-encoded, the way the app's own Finder qui
   assert.equal(decodeURIComponent(url.split('folder=')[1]), '/tmp/Claude code ')
   assert.equal(codex.newSession('/tmp/some repo').url, 'codex://threads/new?path=%2Ftmp%2Fsome%20repo')
 })
+
+// ── Claude Cowork, faked on disk ──────────────────────────────────────────────
+
+const ACCOUNT = '11111111-1111-4111-8111-111111111111'
+const ORG = '22222222-2222-4222-8222-222222222222'
+
+/** A fake Cowork store. The adapter reads its root once, at import, so each store gets a fresh import. */
+async function fakeCowork() {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'cowork-fixture-'))
+  const org = path.join(root, ACCOUNT, ORG)
+  await fsp.mkdir(org, { recursive: true })
+  process.env.BOT_CROSSING_COWORK_SESSIONS = root
+  try {
+    const h = (await import(`../server/harnesses/claude-cowork.mjs?${root}`)).default
+    return { h, root, org, cleanup: () => fsp.rm(root, { recursive: true, force: true }) }
+  } finally {
+    delete process.env.BOT_CROSSING_COWORK_SESSIONS
+  }
+}
+
+/** One session record and its same-named session folder, the way the app lays them out. */
+async function writeCoworkSession(org, fields = {}) {
+  const sessionId = fields.sessionId || `local_${randomUUID()}`
+  const record = {
+    cliSessionId: randomUUID(), title: 'a session', createdAt: Date.now() - HOUR, lastActivityAt: Date.now() - HOUR,
+    model: 'claude-opus-5', isArchived: false, userSelectedFolders: [], hostLoopMode: true, ...fields, sessionId,
+  }
+  const file = path.join(org, `${sessionId}.json`)
+  await fsp.writeFile(file, JSON.stringify(record))
+  const dir = path.join(org, sessionId)
+  await fsp.mkdir(dir, { recursive: true })
+  return { dir, file, record }
+}
+
+test('a recent Cowork session joins the zone of its first folder that still exists', async () => {
+  const { h, root, org, cleanup } = await fakeCowork()
+  try {
+    const folder = path.join(root, 'Work Folder ')
+    await fsp.mkdir(folder)
+    const placed = await writeCoworkSession(org, { title: 'placed', userSelectedFolders: ['/nowhere/gone', folder] })
+    const loose = await writeCoworkSession(org, { title: 'loose' })
+    // Older than the window, file and record alike: never on the map.
+    const old = await writeCoworkSession(org, { title: 'old', lastActivityAt: Date.now() - 40 * DAY })
+    const then = new Date(Date.now() - 40 * DAY)
+    await fsp.utimes(old.file, then, then)
+
+    const byTitle = Object.fromEntries((await h.scanThreads()).map((t) => [t.title, t]))
+    assert.deepEqual(Object.keys(byTitle).sort(), ['loose', 'placed'])
+    const t = byTitle.placed
+    assert.equal(t.id, `claude-cowork:${placed.record.sessionId}`)
+    assert.equal(t.project, 'Work Folder ')
+    assert.equal(t.projectPath, folder)
+    assert.equal(t.cwd, folder)
+    assert.equal(t.model, 'claude-opus-5')
+    assert.equal(t.source, 'cowork')
+    assert.equal(t.canOpen, false)
+    assert.equal(t.unread, false, 'Cowork keeps no focus history')
+    assert.equal(byTitle.loose.project, 'Cowork')
+    assert.equal(byTitle.loose.projectPath, '')
+    void loose
+  } finally {
+    await cleanup()
+  }
+})
+
+test('nothing past the whitelist reaches a Cowork thread: not the prompt, the account, or the files beside it', async () => {
+  const { h, org, cleanup } = await fakeCowork()
+  try {
+    const { dir } = await writeCoworkSession(org, {
+      title: 'guarded',
+      systemPrompt: 'MARKER-PROMPT',
+      emailAddress: 'MARKER-EMAIL',
+      accountName: 'MARKER-ACCOUNT',
+      initialMessage: 'MARKER-FIRST-MESSAGE',
+      remoteMcpServersConfig: { server: 'MARKER-MCP' },
+    })
+    await fsp.writeFile(path.join(dir, '.credentials.json'), '{"token":"MARKER-CREDENTIALS"}')
+    await fsp.writeFile(path.join(dir, '.audit-key'), 'MARKER-AUDIT-KEY')
+    await fsp.writeFile(path.join(dir, 'audit.jsonl'), '{"type":"result","text":"MARKER-AUDIT"}\n')
+    const out = JSON.stringify(await h.scanThreads())
+    assert.ok(out.includes('guarded'), 'the session itself is there')
+    assert.ok(!/MARKER-/.test(out), `nothing sensitive leaks: ${out.match(/MARKER-[A-Z-]+/g)}`)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Cowork offers no link it cannot honour, and starts sessions the way the app\'s own quick action does', async () => {
+  const { h, cleanup } = await fakeCowork()
+  try {
+    assert.equal(await h.detect(), true)
+    assert.equal(h.openThread({ sessionId: `local_${randomUUID()}` }).ok, false)
+    assert.equal(h.newSession('/tmp/some folder ').url, 'claude://cowork/new?folder=%2Ftmp%2Fsome%20folder%20')
+  } finally {
+    await cleanup()
+  }
+  process.env.BOT_CROSSING_COWORK_SESSIONS = path.join(os.tmpdir(), `no-cowork-${randomUUID()}`)
+  const absent = (await import(`../server/harnesses/claude-cowork.mjs?${process.env.BOT_CROSSING_COWORK_SESSIONS}`)).default
+  delete process.env.BOT_CROSSING_COWORK_SESSIONS
+  assert.equal(await absent.detect(), false)
+  assert.deepEqual(await absent.scanThreads(), [])
+})
