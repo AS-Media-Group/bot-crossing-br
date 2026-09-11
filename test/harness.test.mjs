@@ -428,3 +428,25 @@ test('a session that moved into a worktree reports the worktree, and the branch 
     await cleanup()
   }
 })
+
+test('a desktop record from before focus was tracked is not a thread that was never opened', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const old = Date.now() - 30 * DAY
+    const recent = Date.now() - MINUTE
+    // No `lastFocusedAt` key at all — the app did not write one back then.
+    await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/demo', title: 'old', createdAt: old, lastActivityAt: old })
+    await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/demo', title: 'new', createdAt: recent, lastActivityAt: recent })
+    // The key present, and the thread moved on after it: unread exactly as before.
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cwd: '/tmp/demo', title: 'moved on', createdAt: old, lastActivityAt: old + 1000, lastFocusedAt: old,
+    })
+    const byTitle = Object.fromEntries((await h.scanThreads()).map((t) => [t.title, t]))
+    assert.equal(byTitle.old.unread, false, 'months old, never stamped: unknowable, so not asking')
+    assert.equal(byTitle.new.unread, true, 'a new thread nobody has opened yet still asks')
+    assert.equal(byTitle['moved on'].unread, true)
+    assert.equal('hasFocusStamp' in byTitle.old, false, 'bookkeeping stays inside the adapter')
+  } finally {
+    await cleanup()
+  }
+})

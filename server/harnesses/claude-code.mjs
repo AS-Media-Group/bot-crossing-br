@@ -102,6 +102,15 @@ const PROMPT_CHARS = 300
 const ACTIVE_WINDOW_MS = 30 * 60 * 1000
 
 /**
+ * How long a desktop thread with no focus history counts as asking for you. Records the app wrote
+ * before it kept `lastFocusedAt` have no such field, and reading its absence as "never opened" put a
+ * `?` over every one of them — months of threads, all waving. Absent is unknowable, so only a
+ * thread recent enough to plausibly be new is taken as unread on the strength of it: the same three
+ * days after which an astronaut falls asleep anyway.
+ */
+const NEVER_FOCUSED_MS = 3 * 24 * 60 * 60 * 1000
+
+/**
  * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
  * across harnesses, and while two UUIDs will not collide, the colony keys its archive list and
  * saved layout on this string — so it is worth being unambiguous rather than merely lucky.
@@ -441,6 +450,7 @@ function mergeThread(existing, next) {
     createdAt: Math.min(existing.createdAt || Infinity, next.createdAt || Infinity) || 0,
     lastActivityAt: Math.max(existing.lastActivityAt || 0, next.lastActivityAt || 0),
     lastFocusedAt: Math.max(existing.lastFocusedAt || 0, next.lastFocusedAt || 0),
+    hasFocusStamp: existing.hasFocusStamp || next.hasFocusStamp,
     hasError: existing.hasError || next.hasError,
     hasLiveProcess: existing.hasLiveProcess || next.hasLiveProcess,
     starred: existing.starred || next.starred,
@@ -460,7 +470,7 @@ function mergeThread(existing, next) {
 function toThread(t) {
   const {
     desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId,
-    titled, hasLiveProcess, transcriptFile, recordActivityAt, ...rest
+    titled, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, ...rest
   } = t
   return {
     ...rest,
@@ -539,6 +549,7 @@ async function scanThreads() {
       // `lastFocusedAt` instead and every background write puts a `?` over half the colony.
       recordActivityAt: num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
       lastFocusedAt: num(s.lastFocusedAt),
+      hasFocusStamp: 'lastFocusedAt' in s,
       hasLiveProcess: live.has(cliSessionId),
       hasError: Boolean(s.error),
       starred: s.isStarred === true,
@@ -587,6 +598,7 @@ async function scanThreads() {
       createdAt: meta.startedAt || entry.mtime,
       lastActivityAt: activityOf(entry, tail),
       lastFocusedAt: 0,
+      hasFocusStamp: false,
       hasLiveProcess: live.has(id),
       hasError: false,
       starred: false,
@@ -623,11 +635,13 @@ async function scanThreads() {
       now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS
   )
 
-  // Unread = the thread moved on after you last looked at it; never opened counts as unread.
-  // Terminal-only threads have no focus history at all, so "unread" is unknowable — not true.
+  // Unread = the thread moved on after you last looked at it; a recent thread never opened counts
+  // as unread. Terminal-only threads have no focus history at all, so "unread" is unknowable — not
+  // true.
   for (const thread of threads) {
     const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
-    thread.unread = thread.desktopSessionIds.length > 0 && seenAt > thread.lastFocusedAt
+    const moved = thread.hasFocusStamp ? seenAt > thread.lastFocusedAt : now - seenAt < NEVER_FOCUSED_MS
+    thread.unread = thread.desktopSessionIds.length > 0 && moved
     const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
     const waiting =
       thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
