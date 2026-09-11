@@ -13,7 +13,7 @@ import path from 'node:path'
 import { HARNESSES } from '../server/harnesses/index.mjs'
 import codex from '../server/harnesses/codex.mjs'
 import claudeCode from '../server/harnesses/claude-code.mjs'
-import { readTail, findExecutable } from '../server/lib/fsutil.mjs'
+import { readHead, readRecordsUntil, readTail, findExecutable } from '../server/lib/fsutil.mjs'
 import { schemeOf, openInTerminal } from '../server/lib/xdg.mjs'
 
 // ── the contract ──────────────────────────────────────────────────────────────
@@ -155,6 +155,34 @@ test('readTail drops the partial line it lands in the middle of', async () => {
   await fsp.writeFile(f, 'first line\nsecond line\nthird line\n')
   assert.equal(await readTail(f, 15), 'third line\n')
   assert.equal(await readTail(f, 1000), 'first line\nsecond line\nthird line\n')
+})
+
+test('readRecordsUntil reassembles a record bigger than any one read, and stops where asked', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  // 150k two-byte characters: 300KB of UTF-8 behind an odd-length prefix, so characters straddle reads.
+  const huge = { type: 'queue-operation', content: 'é'.repeat(150 * 1024) }
+  const lines = [huge, { type: 'user', cwd: '/tmp/demo' }, { type: 'after' }]
+  await fsp.writeFile(f, lines.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  // What the head reader makes of it: one line longer than the window is no lines at all.
+  assert.equal(await readHead(f, 192 * 1024), '')
+  const records = await readRecordsUntil(f, { maxBytes: 2 * 1024 * 1024, until: (r) => Boolean(r.cwd) })
+  assert.equal(records.length, 2, 'stops at the first record that satisfies until()')
+  assert.equal(records[0].content, huge.content, 'a character split across two reads comes back intact')
+  assert.equal(records[1].cwd, '/tmp/demo')
+})
+
+test('readRecordsUntil gives up at its byte budget rather than reading the whole file', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  const lines = [{ content: 'x'.repeat(300 * 1024) }, { cwd: '/tmp/demo' }]
+  await fsp.writeFile(f, lines.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  assert.deepEqual(await readRecordsUntil(f, { maxBytes: 100 * 1024, until: (r) => Boolean(r.cwd) }), [])
+})
+
+test('readRecordsUntil reads a last line that has no newline after it', async () => {
+  const f = path.join(await fsp.mkdtemp(path.join(os.tmpdir(), 'records-')), 'x.jsonl')
+  await fsp.writeFile(f, JSON.stringify({ a: 1 }) + '\n' + JSON.stringify({ cwd: '/x' }))
+  const records = await readRecordsUntil(f, { maxBytes: 1024, until: (r) => Boolean(r.cwd) })
+  assert.deepEqual(records, [{ a: 1 }, { cwd: '/x' }])
 })
 
 test('findExecutable refuses junk, and refuses a directory that sits on PATH', async () => {

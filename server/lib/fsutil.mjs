@@ -39,6 +39,51 @@ export async function readTail(file, bytes) {
   }
 }
 
+/**
+ * Records from the start of a file, read forward until `until(record)` holds or `maxBytes` have
+ * gone by — for the transcript whose first record is bigger than any head budget.
+ *
+ * `readHead` drops a trailing partial line so `JSON.parse` never sees half a record, and when a
+ * single record is longer than the whole budget that drops *everything*: a 230KB first line read
+ * through a 192KB window leaves nothing to parse, and whatever came after it is never seen. This
+ * carries the partial line across reads instead, so any record that ends inside `maxBytes` arrives
+ * whole. The carry is kept as bytes rather than text, so a character split across two reads is
+ * decoded once, intact.
+ */
+export async function readRecordsUntil(file, { maxBytes, until, chunkBytes = 64 * 1024 }) {
+  const fh = await fsp.open(file, 'r')
+  const out = []
+  try {
+    const buf = Buffer.allocUnsafe(chunkBytes)
+    let carry = Buffer.alloc(0)
+    let pos = 0
+    while (pos < maxBytes) {
+      const { bytesRead } = await fh.read(buf, 0, Math.min(chunkBytes, maxBytes - pos), pos)
+      if (!bytesRead) break
+      pos += bytesRead
+      carry = Buffer.concat([carry, buf.subarray(0, bytesRead)])
+      let nl
+      while ((nl = carry.indexOf(0x0a)) !== -1) {
+        const line = carry.subarray(0, nl).toString('utf8')
+        carry = carry.subarray(nl + 1)
+        for (const record of jsonLines(line)) {
+          out.push(record)
+          if (until(record)) return out
+        }
+      }
+    }
+    // A last line with no newline after it: the file ended mid-line, or the budget did. The first
+    // parses; the second is half a record, and `jsonLines` drops it.
+    for (const record of jsonLines(carry.toString('utf8'))) {
+      out.push(record)
+      if (until(record)) break
+    }
+    return out
+  } finally {
+    await fh.close()
+  }
+}
+
 /** Parse a JSONL blob, skipping the partial or malformed lines a live file always has. */
 export function jsonLines(text) {
   const out = []
