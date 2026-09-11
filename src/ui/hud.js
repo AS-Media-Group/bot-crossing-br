@@ -44,6 +44,7 @@ const ICON = {
   copy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>`,
   locate: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7.6"/><path d="M12 1.8v2.6M12 19.6v2.6M1.8 12h2.6M19.6 12h2.6"/></svg>`,
   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
+  panels: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>`,
 }
 
 const STAT_DEFS = [
@@ -69,6 +70,17 @@ export class Hud {
 
     this.$ = (sel) => this.el.querySelector(sel)
 
+    /*
+     * The one piece of chrome that never hides: the counts, and the way back to the panels. It
+     * sits beside the HUD rather than inside it because hiding the HUD fades the whole layer —
+     * a child cannot stay visible through a parent at opacity 0 — and on a screen with no
+     * keyboard, a hidden HUD with nothing left on screen was a colony you could not get out of.
+     */
+    this.bar = document.createElement('div')
+    this.bar.className = 'floatbar panel'
+    this.bar.innerHTML = BAR_TEMPLATE
+    root.appendChild(this.bar)
+
     this._buildStats()
     this._buildSettings()
     this._buildAvatar()
@@ -79,7 +91,7 @@ export class Hud {
   // ── construction ────────────────────────────────────────────────────────────────────
 
   _buildStats() {
-    const wrap = this.$('.stats')
+    const wrap = this.bar.querySelector('.stats')
     this.statEls = {}
     for (const def of STAT_DEFS) {
       const b = document.createElement('button')
@@ -367,6 +379,16 @@ export class Hud {
     on('#btn-reveal', 'click', () => this.actions.revealProject?.())
     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
     on('#btn-hide-project', 'click', () => this.actions.hideProject?.())
+
+    const onBar = (sel, fn) => this.bar.querySelector(sel).addEventListener('click', fn)
+    onBar('#bar-panels', () => this.toggleUi())
+    onBar('#bar-next', () => this.actions.focusStatus?.('waiting'))
+    onBar('#bar-home', () => this.actions.resetView?.())
+    // Settings live in the HUD, so asking for them from the bar brings the panels back first.
+    onBar('#bar-settings', () => {
+      if (!this.visible) this.toggleUi(true)
+      this.toggleSettings()
+    })
     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
@@ -394,6 +416,8 @@ export class Hud {
       this._last['stat:' + def.key] = n
       el.querySelector('.n').textContent = String(n)
       el.dataset.empty = String(n === 0)
+      // The bar shows only the pip and the number; the words stay available to a screen reader.
+      el.setAttribute('aria-label', `${n} ${def.label}`)
     }
   }
 
@@ -778,6 +802,9 @@ export class Hud {
     this.visible = force ?? !this.visible
     this.el.classList.toggle('hidden', !this.visible)
     this.$('#btn-hide').innerHTML = this.visible ? ICON.eye : ICON.eyeOff
+    const toggle = this.bar.querySelector('#bar-panels')
+    toggle.setAttribute('aria-pressed', String(this.visible))
+    toggle.title = this.visible ? 'Hide the panels (H)' : 'Show the panels (H)'
     this.actions.uiVisibility?.(this.visible)
     if (!this.visible) this.toggleHelp(false)
     return this.visible
@@ -902,6 +929,16 @@ function ago(ts) {
   return `${Math.floor(s / 86400)}d ago`
 }
 
+/** The floating bar: the counts (each one flies to the next astronaut in that state), then the buttons. */
+const BAR_TEMPLATE = `
+<div class="stats"></div>
+<div class="sep"></div>
+<button class="btn icon ghost" id="bar-panels" title="Hide the panels (H)" aria-pressed="true">${ICON.panels}</button>
+<button class="btn icon ghost" id="bar-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
+<button class="btn icon ghost" id="bar-home" title="Reset the view (0)">${ICON.home}</button>
+<button class="btn icon ghost" id="bar-settings" title="Settings (S)">${ICON.settings}</button>
+`
+
 const TEMPLATE = `
 <aside class="side panel">
   <header class="brandbar">
@@ -911,8 +948,6 @@ const TEMPLATE = `
     <button class="btn icon ghost" id="btn-hide" title="Hide all UI (H)">${ICON.eye}</button>
     <button class="btn icon ghost" id="btn-settings" title="Settings (S)" aria-pressed="false">${ICON.settings}</button>
   </header>
-
-  <div class="stats"></div>
 
   <div class="side-body">
     <div class="projects-pane">

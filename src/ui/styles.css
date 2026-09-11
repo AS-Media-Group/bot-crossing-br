@@ -693,6 +693,54 @@ body {
   height: 15px;
 }
 
+/* ── floating bar ───────────────────────────────────────────────────────────────── */
+
+/* The one piece of chrome that never hides: the counts, and the way back to the panels. A
+   sibling of `.hud`, not a child, so it stays when the HUD fades out. Top-left is the one
+   corner nothing else uses; on a phone it moves to the bottom, where a thumb is. */
+.floatbar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 16px;
+  pointer-events: auto;
+  max-width: calc(100vw - 28px - var(--side, 334px));
+}
+
+.floatbar .stats {
+  flex-wrap: nowrap;
+  gap: 4px;
+  padding: 0 2px;
+  border-bottom: none;
+}
+
+/* A pip and a number; the words are in each chip's tooltip and aria-label. */
+.floatbar .stat .lbl {
+  display: none;
+}
+
+.floatbar .sep {
+  width: 1px;
+  height: 22px;
+  margin: 0 4px;
+  background: var(--line);
+  flex: none;
+}
+
+.floatbar .btn.icon {
+  width: 34px;
+  height: 34px;
+}
+
+#bar-panels[aria-pressed='false'] {
+  color: var(--accent, currentColor);
+}
+
 /* ── counts ─────────────────────────────────────────────────────────────────────── */
 
 .stats {
@@ -1398,6 +1446,22 @@ kbd {
   .legend {
     max-width: calc(100vw - 28px);
   }
+  /* The bar goes to the bottom edge, and everything that reached that edge makes room for it. */
+  .floatbar {
+    top: auto;
+    left: 50%;
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    max-width: calc(100vw - 20px);
+  }
+  .side,
+  .settings {
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+  }
+  .toasts,
+  .fps {
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+  }
 }
 
 @media (max-width: 600px) {
@@ -1408,6 +1472,19 @@ kbd {
   .brand span,
   .stats .stat .lbl {
     display: none;
+  }
+  /* A phone is too narrow for five counts and four buttons: a count at zero says nothing, so it
+     steps out, and what is left tightens up. */
+  .floatbar .stat {
+    padding: 0 7px;
+    gap: 4px;
+  }
+  .floatbar .stat[data-empty='true'] {
+    display: none;
+  }
+  .floatbar .btn.icon {
+    width: 32px;
+    height: 32px;
   }
 }
 
