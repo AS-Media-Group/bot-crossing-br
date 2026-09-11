@@ -45,6 +45,8 @@ const WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const RECORD = /^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i
+/** A routine's id becomes part of a thread id, so only the app's own kebab-case shape is taken. */
+const TASK_ID = /^[a-z0-9][a-z0-9-]*$/
 
 /** Prefixed, per the contract in `server/harnesses/README.md`. */
 const ID = (raw) => `claude-cowork:${raw}`
@@ -125,6 +127,22 @@ async function recentRecords(orgs, now) {
   return out
 }
 
+/** The routines switched on in the app, each with the folders it was given. */
+async function routinesIn(org) {
+  let tasks
+  try {
+    tasks = JSON.parse(await fsp.readFile(path.join(org, 'scheduled-tasks.json'), 'utf8')).scheduledTasks
+  } catch {
+    return new Map()
+  }
+  const out = new Map()
+  for (const t of Array.isArray(tasks) ? tasks : []) {
+    if (!t || t.enabled !== true || typeof t.id !== 'string' || !TASK_ID.test(t.id)) continue
+    out.set(t.id, { folders: strings(t.userSelectedFolders) })
+  }
+  return out
+}
+
 /** The first folder that is still a directory on this machine, or `''` — checked, never assumed. */
 async function firstFolder(folders) {
   for (const folder of folders) {
@@ -178,12 +196,35 @@ async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallba
 async function scanThreads() {
   const now = Date.now()
   const orgs = await orgDirs()
+  const enabled = new Map()
+  for (const org of orgs) for (const [taskId, task] of await routinesIn(org)) enabled.set(taskId, task)
+
   const threads = []
+  const runs = new Map()
   for (const record of await recentRecords(orgs, now)) {
     if (now - record.lastActivityAt > WINDOW_MS) continue
-    // Scheduled runs belong to their routine, not to the map one by one.
-    if (record.scheduledTaskId || record.sessionType === 'scheduled') continue
+    if (record.scheduledTaskId || record.sessionType === 'scheduled') {
+      // A run of a routine that has since been switched off, or of none at all, is history.
+      if (!enabled.has(record.scheduledTaskId)) continue
+      if (!runs.has(record.scheduledTaskId)) runs.set(record.scheduledTaskId, [])
+      runs.get(record.scheduledTaskId).push(record)
+      continue
+    }
     threads.push(await threadFor(ID(record.sessionId), record, { folders: record.userSelectedFolders }))
+  }
+
+  /*
+   * One astronaut per routine, whatever it has run since. A daily routine is hundreds of records and
+   * would bury every other zone on the map; as one thread it is a place to see at a glance whether
+   * this morning's run worked. Its id is the routine's, not a run's, so the astronaut stays put from
+   * one day's run to the next.
+   */
+  for (const [taskId, list] of runs) {
+    list.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
+    const latest = list[0]
+    const folders = latest.userSelectedFolders.length ? latest.userSelectedFolders : enabled.get(taskId).folders
+    const createdAt = Math.min(...list.map((r) => r.createdAt || r.lastActivityAt))
+    threads.push(await threadFor(ID(`task:${taskId}`), latest, { folders, routine: taskId, createdAt, fallbackTitle: taskId }))
   }
   return threads
 }

@@ -825,3 +825,39 @@ test('Cowork offers no link it cannot honour, and starts sessions the way the ap
   assert.equal(await absent.detect(), false)
   assert.deepEqual(await absent.scanThreads(), [])
 })
+
+test('an enabled routine is one astronaut, however often it has run; a disabled one is not on the map', async () => {
+  const { h, root, org, cleanup } = await fakeCowork()
+  try {
+    const folder = path.join(root, 'Briefs')
+    await fsp.mkdir(folder)
+    await fsp.writeFile(path.join(org, 'scheduled-tasks.json'), JSON.stringify({
+      scheduledTasks: [
+        { id: 'morning-brief', enabled: true, userSelectedFolders: [folder] },
+        { id: 'old-sync', enabled: false, userSelectedFolders: [] },
+        { id: 'quiet-one', enabled: true, userSelectedFolders: [] },
+      ],
+    }))
+    const run = (task, ago, extra = {}) => writeCoworkSession(org, {
+      scheduledTaskId: task, sessionType: 'scheduled', createdAt: Date.now() - ago, lastActivityAt: Date.now() - ago, ...extra,
+    })
+    await run('morning-brief', 3 * DAY, { title: 'brief, three days ago' })
+    await run('morning-brief', 2 * DAY, { title: 'brief, two days ago' })
+    await run('morning-brief', HOUR, { title: 'brief, latest', error: 'rate limited' })
+    await run('old-sync', HOUR, { title: 'disabled routine' })
+    const stale = await run('quiet-one', 40 * DAY, { title: 'quiet, long ago' })
+    const then = new Date(Date.now() - 40 * DAY)
+    await fsp.utimes(stale.file, then, then)
+
+    const threads = await h.scanThreads()
+    assert.deepEqual(threads.map((t) => t.id), ['claude-cowork:task:morning-brief'])
+    const [t] = threads
+    assert.equal(t.title, 'brief, latest')
+    assert.equal(t.routine, 'morning-brief')
+    assert.equal(t.hasError, true, 'the latest run failed')
+    assert.equal(t.project, 'Briefs', "placed by the routine's own folder when its runs name none")
+    assert.ok(Math.abs(t.createdAt - (Date.now() - 3 * DAY)) < MINUTE, 'created when its first run in the window was')
+  } finally {
+    await cleanup()
+  }
+})
