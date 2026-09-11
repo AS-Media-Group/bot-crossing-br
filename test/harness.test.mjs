@@ -788,6 +788,23 @@ test('a recent Cowork session joins the zone of its first folder that still exis
   }
 })
 
+test('a folder given with a trailing separator lands in the same zone as the folder itself', async () => {
+  const { h, root, org, cleanup } = await fakeCowork()
+  try {
+    const folder = path.join(root, 'Website')
+    await fsp.mkdir(folder)
+    await writeCoworkSession(org, { title: 'clean', userSelectedFolders: [folder] })
+    await writeCoworkSession(org, { title: 'trailing', userSelectedFolders: [`${folder}${path.sep}`] })
+
+    const byTitle = Object.fromEntries((await h.scanThreads()).map((t) => [t.title, t]))
+    assert.equal(byTitle.trailing.projectPath, byTitle.clean.projectPath, 'same resolved path, not two zones')
+    assert.equal(byTitle.trailing.project, byTitle.clean.project)
+    assert.equal(byTitle.trailing.projectPath, folder, 'resolved, so no trailing separator survives')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('nothing past the whitelist reaches a Cowork thread: not the prompt, the account, or the files beside it', async () => {
   const { h, org, cleanup } = await fakeCowork()
   try {
@@ -857,6 +874,29 @@ test('an enabled routine is one astronaut, however often it has run; a disabled 
     assert.equal(t.hasError, true, 'the latest run failed')
     assert.equal(t.project, 'Briefs', "placed by the routine's own folder when its runs name none")
     assert.ok(Math.abs(t.createdAt - (Date.now() - 3 * DAY)) < MINUTE, 'created when its first run in the window was')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('an enabled routine still appears, and reports unarchived, when its latest run was archived', async () => {
+  const { h, org, cleanup } = await fakeCowork()
+  try {
+    await fsp.writeFile(path.join(org, 'scheduled-tasks.json'), JSON.stringify({
+      scheduledTasks: [{ id: 'morning-brief', enabled: true, userSelectedFolders: [] }],
+    }))
+    const run = (ago, extra = {}) => writeCoworkSession(org, {
+      scheduledTaskId: 'morning-brief', sessionType: 'scheduled',
+      createdAt: Date.now() - ago, lastActivityAt: Date.now() - ago, ...extra,
+    })
+    await run(2 * DAY, { title: 'brief, two days ago' })
+    // The run itself was archived after being read; the routine astronaut it's the latest of should not vanish.
+    await run(HOUR, { title: 'brief, latest', isArchived: true })
+
+    const threads = await h.scanThreads()
+    assert.deepEqual(threads.map((t) => t.id), [`claude-cowork:task:${ORG}:morning-brief`])
+    assert.equal(threads[0].title, 'brief, latest')
+    assert.equal(threads[0].archived, false, 'the routine is history-tracked by its enabled flag, not a run')
   } finally {
     await cleanup()
   }

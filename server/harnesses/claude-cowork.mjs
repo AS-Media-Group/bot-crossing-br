@@ -17,17 +17,46 @@
  * Read-only, no subprocess, and nothing is ever read from inside `Claude.app`.
  */
 import fsp from 'node:fs/promises'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { exists, listDirs, listFiles, num } from '../lib/fsutil.mjs'
 
 const HOME = os.homedir()
 
+/**
+ * Windows has two answers, because the app ships two ways: the classic installer writes to
+ * `%APPDATA%\Claude`, but installed from the Microsoft Store the app is an MSIX package, which
+ * redirects what it believes is `%APPDATA%` into its own private
+ * `…\Packages\<family>\LocalCache\Roaming` — so `%APPDATA%\Claude` doesn't exist at all, "in a way
+ * that looks exactly like the app having been uninstalled." Mirrors `windowsDataDir()` in
+ * `claude-code.mjs` (see its comment for the full reasoning); duplicated rather than imported
+ * because the two adapters probe for different session folders. Resolved once, at import, the
+ * same trade-off as there: installing the app while the colony runs wants a restart to notice.
+ */
+function windowsDataDir() {
+  const roaming = path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Claude')
+  const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local')
+  const candidates = [roaming]
+  try {
+    for (const entry of readdirSync(path.join(local, 'Packages'), { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith('Claude_')) {
+        candidates.push(path.join(local, 'Packages', entry.name, 'LocalCache', 'Roaming', 'Claude'))
+      }
+    }
+  } catch {
+    /* no Packages directory — this machine has no Store apps at all */
+  }
+  // Whichever actually holds Cowork's sessions; falls back to the unpackaged path so callers
+  // always get a real path, which `detect()` reads as "no app" when neither one exists.
+  return candidates.find((dir) => existsSync(path.join(dir, 'local-agent-mode-sessions'))) || roaming
+}
+
 /** Where the Claude desktop app keeps its data: Electron's `userData` for an app named "Claude". */
 function claudeDataDir() {
   switch (process.platform) {
     case 'win32':
-      return path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Claude')
+      return windowsDataDir()
     case 'linux':
       return path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'Claude')
     default:
@@ -195,12 +224,17 @@ async function isLive(run) {
   return false
 }
 
-/** The first folder that is still a directory on this machine, or `''` — checked, never assumed. */
+/**
+ * The first folder that is still a directory on this machine, or `''` — checked, never assumed.
+ * Resolved with `path.resolve` so a trailing separator or a `.`/`..` segment can't make one real
+ * folder look like two different paths to `disambiguateProjects` and rename an existing zone.
+ */
 async function firstFolder(folders) {
   for (const folder of folders) {
     if (!path.isAbsolute(folder)) continue
+    const resolved = path.resolve(folder)
     try {
-      if ((await fsp.stat(folder)).isDirectory()) return folder
+      if ((await fsp.stat(resolved)).isDirectory()) return resolved
     } catch {
       /* moved or deleted since the session ran */
     }
@@ -214,10 +248,14 @@ async function firstFolder(folders) {
  * zone when it was given none that still exists. A session's own cwd is a scratch `outputs`
  * folder inside the store, which is nobody's idea of where the work lives.
  */
-async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallbackTitle = '' }, now) {
+async function threadFor(id, run, opts, now) {
+  const { folders, routine = '', createdAt = 0, fallbackTitle = '', archived = run.isArchived } = opts
   const folder = await firstFolder(folders)
   const transcript = await transcriptOf(run)
-  const live = transcript ? await isLive(run) : false
+  // isLive() reads a registry and probes a pid, so it's only worth the cost when the transcript
+  // is fresh enough to matter — that also keeps it off pids from old, possibly-recycled registries.
+  const fresh = Boolean(transcript) && now - transcript.mtime < ACTIVE_WINDOW_MS
+  const live = fresh ? await isLive(run) : false
   return {
     id,
     title: run.title || fallbackTitle || 'Untitled session',
@@ -234,12 +272,12 @@ async function threadFor(id, run, { folders, routine = '', createdAt = 0, fallba
     // Cowork keeps no focus history, so "have you read this" is unknowable rather than false.
     lastFocusedAt: 0,
     unread: false,
-    running: live && now - transcript.mtime < ACTIVE_WINDOW_MS,
+    running: live,
     hasError: run.hasError,
     starred: run.isStarred,
     routine,
     prState: '',
-    archived: run.isArchived,
+    archived,
     sizeBytes: transcript ? transcript.size : 0,
     source: 'cowork',
     canOpen: false,
@@ -287,7 +325,10 @@ async function scanThreads() {
     const createdAt = Math.min(...list.map((r) => r.createdAt || r.lastActivityAt))
     threads.push(
       await threadFor(ID(`task:${key}`), latest, {
-        folders, routine: taskId, createdAt, fallbackTitle: taskId,
+        // A run gets archived on its own; the routine itself is only retired by turning it off,
+        // which already drops it above (`!enabled.has(key)`) — so the astronaut never inherits
+        // "archived" from whichever run happens to be latest.
+        folders, routine: taskId, createdAt, fallbackTitle: taskId, archived: false,
       }, now),
     )
   }
