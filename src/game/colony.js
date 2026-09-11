@@ -850,6 +850,23 @@ export class Colony {
     return this.astronauts.pick(this.camera, ndcX, ndcY, aspect)
   }
 
+  /**
+   * The thread whose building is under the pointer, or null. One building is one thread, the
+   * same as its astronaut, so clicking either should open the same card. A CPU raycast, and only
+   * ever on a click — a merged building is thousands of triangles, and a click is one moment, not
+   * every frame. A building still rising is tested at its full height, which is close enough to aim at.
+   */
+  pickBuilding(ndcX, ndcY) {
+    this._raycaster ??= new THREE.Raycaster()
+    this._raycaster.setFromCamera((this._pickNdc ??= new THREE.Vector2()).set(ndcX, ndcY), this.camera)
+    const owner = new Map()
+    for (const [id, entry] of this.buildings) if (!entry.retiring) owner.set(entry.mesh, id)
+    for (const hit of this._raycaster.intersectObjects([...owner.keys()], true)) {
+      for (let o = hit.object; o; o = o.parent) if (owner.has(o)) return owner.get(o)
+    }
+    return null
+  }
+
   agentFor(id) {
     return this.astronauts.byId.get(id)
   }

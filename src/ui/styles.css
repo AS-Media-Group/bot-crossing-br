@@ -81,13 +81,15 @@ body {
   --side: 334px;
 }
 
-.hud.hidden {
+/* Hiding puts the panels away — not the card for the astronaut or building you clicked, and not
+   the toasts. Those float over the map for the thing in front of you, so the colony can be played
+   with the panels out of sight. */
+.hud.hidden > :not(.thread-pop):not(.toasts) {
   opacity: 0;
-  transform: scale(0.985);
   pointer-events: none !important;
 }
 
-.hud.hidden * {
+.hud.hidden > :not(.thread-pop):not(.toasts) * {
   pointer-events: none !important;
 }
 

@@ -25,6 +25,11 @@ import { PLOT_PALETTE, hashString } from '../world/plots.js'
 const IS_MAC = /Mac/.test(navigator.platform)
 const FILE_MANAGER = IS_MAC ? 'Finder' : /Win/.test(navigator.platform) ? 'Explorer' : 'Files'
 
+/** Phone-width layout: the floating bar sits along the bottom edge (see `.floatbar` in styles.css). */
+const NARROW = window.matchMedia('(max-width: 820px)')
+/** How much of the bottom edge the floating bar takes at phone width, so the card can avoid it. */
+const BAR_CLEARANCE = 60
+
 const ICON = {
   settings: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
   eye: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>`,
@@ -655,7 +660,9 @@ export class Hud {
     const size = this._cardSize || { w: 280, h: 150 }
     const margin = 12
     const gap = 26
-    const rightWall = window.innerWidth - margin - (this._sideWidth || 0)
+    // With the panels put away the card has the whole width; on a phone it stays above the bar.
+    const rightWall = window.innerWidth - margin - (this.visible ? this._sideWidth || 0 : 0)
+    const bottomWall = window.innerHeight - margin - (NARROW.matches ? BAR_CLEARANCE : 0)
 
     let flip = false
     let left = screen.x + gap
@@ -665,7 +672,7 @@ export class Hud {
       // Nowhere to go on either side — sit over the middle rather than off the edge.
       if (left < margin) left = Math.min(Math.max(margin, screen.x - size.w / 2), rightWall - size.w)
     }
-    const top = Math.min(Math.max(margin, screen.y - size.h / 2), window.innerHeight - margin - size.h)
+    const top = Math.min(Math.max(margin, screen.y - size.h / 2), bottomWall - size.h)
 
     if (!this._cardOn) {
       this._cardOn = true

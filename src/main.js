@@ -477,11 +477,20 @@ engine.canvas.addEventListener('pointerup', (e) => {
     select(agent.id, {})
     return
   }
+  // A building is its thread, just as its astronaut is — unless a name plate is in front of it.
+  const building = colony.pickLabel(p.x, p.y) ? null : colony.pickBuilding(p.x, p.y)
+  if (building && colony.agentFor(building)) {
+    select(building, {})
+    return
+  }
   // Nobody there: a zone's deck or its name plate opens that repo's sidebar instead, and
-  // bare ground puts everything down.
+  // bare ground puts everything down. The repo view only exists in the sidebar, so asking for
+  // a repo with the panels put away brings them back.
   const plot = plotUnder(e, p)
-  if (plot) selectProject(plot.name, {})
-  else {
+  if (plot) {
+    if (!hud.visible) hud.toggleUi(true)
+    selectProject(plot.name, {})
+  } else {
     select(null, {})
     actions.closeProject()
   }
