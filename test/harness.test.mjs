@@ -407,6 +407,29 @@ test('a thread is as recent as its last timestamped record, not a metadata write
   }
 })
 
+test('a last record bigger than the tail still dates the thread, not the metadata after it', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const id = randomUUID()
+    const cwd = '/tmp/demo'
+    const spoke = ago(10 * DAY)
+    const file = await writeTranscript(h, cwd, id, [
+      userSays('take a screenshot', { sessionId: id, cwd, timestamp: spoke }),
+      // A screenshot or a long tool result: one record longer than the whole 64 KiB tail.
+      answers({ sessionId: id, cwd, timestamp: spoke }, [{ type: 'text', text: 'x'.repeat(80 * 1024) }]),
+      { type: 'custom-title', customTitle: 'renamed later', sessionId: id },
+      { type: 'mode', mode: 'default', sessionId: id },
+    ])
+    const now = new Date()
+    await fsp.utimes(file, now, now)
+    const [t] = await h.scanThreads()
+    assert.equal(t.lastActivityAt, Date.parse(spoke), 'no timestamp in the window is not "dated by mtime"')
+    assert.equal(t.title, 'renamed later')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('a session that moved into a worktree reports the worktree, and the branch it is on now', async () => {
   const { h, cleanup } = await fakeClaude()
   try {
@@ -423,6 +446,30 @@ test('a session that moved into a worktree reports the worktree, and the branch 
     assert.equal(t.worktree, 'feature-x')
     assert.equal(t.project, 'my-repo')
     assert.equal(t.gitBranch, 'worktree-feature-x')
+    assert.equal(t.ref.cwd, wt, 'resuming has to happen where the session is, not where it began')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a session stays in its worktree after the move has scrolled out of the tail', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const wt = `${REPO}/.claude/worktrees/feature-x`
+    const id = randomUUID()
+    const there = { sessionId: id, cwd: wt, gitBranch: 'worktree-feature-x' }
+    // The move is written once. A few big tool results after it and it is no longer in the last 64 KiB.
+    const big = [{ type: 'text', text: 'x'.repeat(20 * 1024) }]
+    const work = [1, 2, 3, 4, 5].map((n) => answers({ ...there, timestamp: ago((50 - n) * MINUTE) }, big))
+    await writeTranscript(h, wt, id, [
+      userSays('start', { sessionId: id, cwd: REPO, gitBranch: 'main', timestamp: ago(HOUR) }),
+      { type: 'relocated', sessionId: id, relocatedCwd: wt },
+      userSays('carry on', { ...there, timestamp: ago(50 * MINUTE) }),
+      ...work,
+    ])
+    const [t] = await h.scanThreads()
+    assert.equal(t.cwd, wt)
+    assert.equal(t.worktree, 'feature-x')
     assert.equal(t.ref.cwd, wt, 'resuming has to happen where the session is, not where it began')
   } finally {
     await cleanup()

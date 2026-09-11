@@ -262,6 +262,15 @@ async function scanTranscripts() {
 /** How much of a transcript's end it takes to see whose turn it is. One record is plenty. */
 const TAIL_BYTES = 64 * 1024
 
+/**
+ * How far back to look when the tail above holds no timestamped record at all. `readTail` drops the
+ * partial line its window starts in, so a last record bigger than the window — a screenshot, a long
+ * tool result — or a batch of bookkeeping bigger than it leaves nothing to date the thread by, and
+ * falling back to mtime is the very bug the tail exists to fix. The tail itself stays small because
+ * nearly every transcript is answered by it; only one that is not pays for this, once per change.
+ */
+const WIDE_TAIL_BYTES = 2 * 1024 * 1024
+
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
 const metaCache = new Map()
 async function transcriptMeta(entry) {
@@ -321,14 +330,15 @@ async function openingMeta(entry) {
  */
 function readTranscriptTail(records) {
   const tail = {
-    lastRecordAt: 0, relocatedCwd: '', gitBranch: '', customTitle: '', aiTitle: '', endsInSession: '',
-    handedBack: false, handedBackAt: 0,
+    lastRecordAt: 0, relocatedCwd: '', cwd: '', gitBranch: '', customTitle: '', aiTitle: '',
+    endsInSession: '', handedBack: false, handedBackAt: 0,
   }
   let turn = null
   for (const r of records) {
     const t = r.timestamp ? Date.parse(r.timestamp) : NaN
     if (!Number.isNaN(t) && t > tail.lastRecordAt) tail.lastRecordAt = t
     if (typeof r.relocatedCwd === 'string' && r.relocatedCwd) tail.relocatedCwd = r.relocatedCwd
+    if (typeof r.cwd === 'string' && r.cwd) tail.cwd = r.cwd
     if (r.gitBranch && r.gitBranch !== 'HEAD') tail.gitBranch = r.gitBranch
     if (r.customTitle) tail.customTitle = r.customTitle
     if (r.aiTitle) tail.aiTitle = r.aiTitle
@@ -369,6 +379,11 @@ async function transcriptTail(entry) {
   let tail
   try {
     tail = readTranscriptTail(jsonLines(await readTail(entry.file, TAIL_BYTES)))
+    // No timestamp in a tail shorter than the file is a window that ran out inside one big record,
+    // not a transcript with nothing to date it by. Once, wider, and bounded — then whatever it says.
+    if (!tail.lastRecordAt && entry.size > TAIL_BYTES) {
+      tail = readTranscriptTail(jsonLines(await readTail(entry.file, WIDE_TAIL_BYTES)))
+    }
   } catch {
     tail = readTranscriptTail([])
   }
@@ -387,12 +402,20 @@ const titleOf = (meta, tail) =>
  * Where a terminal thread works. Its transcript's folder is named after the cwd it lives in *now*
  * — a session that moves into a worktree has its transcript moved with it — so whichever cwd it
  * reported that encodes to that name wins over the one it happened to start in.
+ *
+ * The tail's own latest cwd is a candidate as well as the record of the move. That record is written
+ * once, and a session that goes on working pushes it out of the tail within a few file reads; every
+ * record after it carries the new cwd, though. Asking the move alone sent such a thread back to the
+ * repo root it began in, and resuming it ran there — where its transcript is not.
+ *
+ * When none of them encodes to it, the folder is resolved before the opening cwd is fallen back on:
+ * that one has just been shown not to be where the transcript lives.
  */
 function whereItRuns(dirName, meta, tail, known) {
-  for (const cwd of [tail.relocatedCwd, meta.cwd]) {
+  for (const cwd of [tail.relocatedCwd, tail.cwd, meta.cwd]) {
     if (cwd && encodeProjectDir(cwd) === dirName) return cwd
   }
-  return meta.cwd || resolveProjectDir(dirName, known)
+  return resolveProjectDir(dirName, known) || meta.cwd || tail.cwd
 }
 
 /**
@@ -586,6 +609,7 @@ async function scanThreads() {
     learn(s.originCwd)
     learn(meta?.cwd)
     learn(tail?.relocatedCwd)
+    learn(tail?.cwd)
 
     // The desktop record's own stamp lags: the app writes it when the thread is focused, so a
     // session running in a terminal — or in a window you are not looking at — reads as hours
@@ -649,6 +673,7 @@ async function scanThreads() {
     const tail = await transcriptTail(entry)
     learn(meta.cwd)
     learn(tail.relocatedCwd)
+    learn(tail.cwd)
     loose.push({ id, entry, meta, tail })
   }
 
