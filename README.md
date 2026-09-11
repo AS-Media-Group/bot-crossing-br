@@ -1,6 +1,11 @@
-# Bot Crossing — your agent threads, as a colony
+# Bot Crossing — your agent threads, as a colony (AS Media Group fork)
 
-**[botcrossing.com](https://botcrossing.com)**
+> **This is a fork.** The original Bot Crossing is by **[Jarren Rocks](https://jarren.rocks)** —
+> [Station-Sciences/bot-crossing](https://github.com/Station-Sciences/bot-crossing) ·
+> **[botcrossing.com](https://botcrossing.com)**. This copy is maintained by
+> [AS Media Group](https://github.com/AS-Media-Group) and carries the changes listed in
+> [What this fork changes](#what-this-fork-changes). It is not maintained or endorsed by the
+> original author, so please report problems with this fork here rather than upstream.
 
 Every coding-agent thread on this machine is a little astronaut. They walk out of the ship, claim
 a plot for their repo, and build something. When one needs you it stops and holds a `?` over
@@ -10,9 +15,102 @@ It reads the harness's own files, on your own machine. Nothing is uploaded, ther
 account, and **it never writes to a harness at all** — `data/colony.json`, where the map lives,
 is the only file it writes anywhere.
 
-> **Status:** published as-is. I built this for myself and cannot promise to maintain it —
-> issues and PRs are welcome but may go unanswered, and forking is an entirely reasonable
-> thing to do. [CONTRIBUTING.md](CONTRIBUTING.md) sets out what to expect.
+> **Upstream status**, in the original author's words: published as-is. I built this for myself
+> and cannot promise to maintain it — issues and PRs are welcome but may go unanswered, and
+> forking is an entirely reasonable thing to do. [CONTRIBUTING.md](CONTRIBUTING.md) sets out
+> what to expect from the upstream project.
+>
+> Apart from the fork notices, the rest of this README is the original author's text (the
+> "I" throughout), updated wherever this fork changes how something works.
+
+## What this fork changes
+
+Everything below is on the `asmg/main` branch, the default here. `main` is kept as an untouched
+mirror of upstream, so the two can be compared at any time:
+[`main...asmg/main`](https://github.com/AS-Media-Group/bot-crossing-br/compare/main...asmg/main).
+It started as an audit of the original, and each fix below came out of it. The test suite grew
+from 33 tests to 82.
+
+### A map that tells the truth
+
+- **Threads land in the right repo.** The folder a thread ran in is read from its transcript,
+  even when a very long first prompt pushes it past the usual head read. A folder name is only
+  ever checked against a real path, never *decoded* into one — Claude Code's folder encoding
+  loses information, and decoding it invented zones that were really words from a path.
+- **"Needs you" means it.** A record written before the app began tracking focus no longer
+  counts as a thread you have never opened, which had most of a real thread list waving `?`.
+- **Activity is real activity.** A thread is dated by its last real record, not by the file's
+  modified time, so housekeeping writes no longer wake up threads that have been quiet for weeks.
+  Its title, branch and worktree come from its latest records.
+- **No duplicate astronauts.** The transcript copies the desktop app leaves behind fold into the
+  thread they belong to.
+- **Working means working.** A live thread counts as busy while its subagents write after it
+  hands back to you, and a process the server is not allowed to signal counts as alive.
+
+### A locked-down server
+
+- **Origin is matched exactly, port included.** Before, any other page on `localhost` (another
+  dev server, say) shared the colony's hostname and could read every thread title and prompt.
+- **The dev server's CORS is closed**, along with its open-in-editor route and the repo files it
+  would otherwise serve.
+- **Finder / Copy path and New conversation work only in folders a scanned thread ran in**, so
+  the server can never be asked to `open` an app bundle or any other path.
+- **New conversation links percent-encode the folder** (`%20`, not `+`), the way the apps' own
+  quick actions do, so folders with spaces open correctly.
+- **The built server checks `Host` on every route**, and bad input no longer crashes it.
+
+### A colony file that survives a bad day
+
+- **An unreadable colony file is never overwritten.** A file that cannot be read, or is not
+  valid JSON, is reported with a 503 and left exactly as it is. Upstream treated it as an empty
+  colony and saved over your layout.
+- **A failed write no longer takes the server down.**
+- **A page that failed to load the colony never saves over it later.** It retries, and reloads
+  once the file is back.
+- **`BOT_CROSSING_DATA` never creates the parent folder**, so a missing drive fails loudly
+  instead of quietly starting a fresh colony somewhere nobody looks.
+
+### Claude Cowork on the map
+
+A new read-only adapter, `server/harnesses/claude-cowork.mjs`, shows Claude Cowork alongside
+Claude Code:
+
+- Interactive sessions from the last 30 days, each placed in the zone of the first folder it
+  was given, otherwise a "Cowork" zone.
+- One astronaut for each enabled routine, built from all of its runs.
+- It reads only a short whitelist of fields. The credential and audit files that sit beside
+  Cowork's session records are never opened.
+- **Open** is greyed out, because there is no known link to a single Cowork session yet.
+  **New conversation** starts a Cowork task in that folder.
+
+### Your own devices, anywhere
+
+- **`BOT_CROSSING_ALLOWED_HOSTS`** lists extra hostnames the server will answer to, so
+  [Tailscale Serve](https://tailscale.com/kb/1312/serve) can put the colony on your own tailnet,
+  over HTTPS, without binding to the network. See
+  [Reaching it from your own devices, anywhere](#reaching-it-from-your-own-devices-anywhere).
+
+### A floating bar, and cards without the sidebar
+
+- **A floating bar that never hides.** The status counts (building, need you, blocked,
+  shipped, crew) sit in a small bar at the top-left, alongside buttons to show or hide the
+  panels, jump to the next thread waiting on you, reset the view, and open settings. Upstream,
+  hiding the sidebar left no way back without a keyboard. On a phone the bar sits at the bottom
+  of the screen, and counts at zero drop out.
+- **Clicking an astronaut *or its building* opens the thread's card**, even with the panels
+  hidden. Clicking a zone while they are hidden brings them back on that repo.
+
+Design notes and plans for the larger changes are in
+[`docs/superpowers/`](docs/superpowers/).
+
+### Keeping up with upstream
+
+```bash
+git remote add upstream https://github.com/Station-Sciences/bot-crossing.git
+git fetch upstream
+git checkout main && git merge --ff-only upstream/main && git push origin main
+git checkout asmg/main && git merge main
+```
 
 ## Run it
 
@@ -42,7 +140,7 @@ somebody writing that adapter.
 | Harness | Status |
 | --- | --- |
 | **[Claude Code](https://claude.com/claude-code)** (Anthropic) | ✅ **Supported** — desktop app and CLI, including worktrees and live-process detection |
-| **Claude Cowork** (Anthropic) | ✅ **Supported** — interactive sessions from the last 30 days, and one astronaut per enabled routine; placed in the zone of the first folder a session was given. Open is not available yet (no link to a single Cowork session) |
+| **Claude Cowork** (Anthropic) | ✅ **Supported** *(added in this fork)* — interactive sessions from the last 30 days, and one astronaut per enabled routine; placed in the zone of the first folder a session was given. Open is not available yet (no link to a single Cowork session) |
 | **[Codex](https://developers.openai.com/codex/cli)** (OpenAI) | ✅ **Supported** — desktop, VS Code and CLI sessions, opened through `codex://` |
 | [OpenCode](https://opencode.ai) | ⬜ Not yet |
 | [Antigravity CLI](https://antigravity.google) (Google) | ⬜ Not yet — the successor to Gemini CLI, which Google stopped serving individual accounts on 18 June 2026 |
@@ -170,12 +268,15 @@ adopts the ground it got to instead of pushing on.
 
 ## Clicking one
 
-All of the chrome is one panel on the right — the name, the counts, and every repo. There
+The chrome is one panel on the right, holding the name and every repo, plus *(in this fork)*
+a small floating bar holding the counts and the buttons you need to get the panel back. There
 is no top bar and no strip along the bottom: a colony is a place, and a place reads better
 without a frame around it.
 
 An astronaut, a zone's deck, the name plate over it, or a repo in that list — all four drill
-into the same repo. Picking somebody is also picking the zone they are standing on.
+into the same repo. Picking somebody is also picking the zone they are standing on. *(This
+fork:)* clicking a building picks the thread it belongs to, just like clicking its astronaut,
+and clicking a zone while the panels are hidden brings them back on that repo.
 
 **The repo**, at the top, whether or not anybody is selected:
 
@@ -196,6 +297,8 @@ you clicked, so the card follows its astronaut around the screen — preferring 
 flipping to its left rather than sliding under the sidebar, and never leaving the window.
 It is moved with a transform rather than with `left`/`top`, the one geometric change a
 browser makes without touching layout, so following a walking astronaut costs nothing.
+*(This fork:)* the card stays available with the panels hidden, and on a phone it keeps clear
+of the floating bar at the bottom.
 
 - **Open** hands the thread back to whichever harness owns it and its app comes forward. On a
   Linux box with no desktop app to answer the deep link, a terminal opens with the CLI resuming
@@ -274,7 +377,7 @@ under **View → Return to isometric**.
 
 | Key | Does |
 | --- | --- |
-| `H` / `⌘\` | **Hide every panel.** The colony still reads: status lives above the astronauts' heads |
+| `H` / `⌘\` | **Hide every panel.** The colony still reads: status lives above the astronauts' heads. *(This fork:)* the floating bar stays, and its panels button brings them back |
 | `S` | Settings |
 | `N` | Fly to the next astronaut waiting on you |
 | `Enter` / `A` | Open / archive the selected thread |
@@ -611,15 +714,18 @@ refused, so a page served from the LAN address by something else cannot pass as 
 
 ### Reaching it from your own devices, anywhere
 
-Rather than binding to the network, keep the server on loopback and let
+*(Added in this fork.)* Rather than binding to the network, keep the server on loopback and let
 [Tailscale Serve](https://tailscale.com/kb/1312/serve) publish it to your own tailnet — your devices,
 signed in to your account, and nothing public (Serve, never Funnel). Serve forwards requests under the
 machine's tailnet name, so list the names it may arrive as:
 
 ```bash
 BOT_CROSSING_ALLOWED_HOSTS=my-mac.tail1234.ts.net,my-mac npm run serve
-tailscale serve --bg http://127.0.0.1:5274
+tailscale serve --bg --https=443 http://127.0.0.1:5274
 ```
+
+With HTTPS certificates turned on for the tailnet, that serves it at
+`https://my-mac.tail1234.ts.net`, with a certificate Tailscale renews on its own.
 
 Exact hostnames only, from this machine's environment — no page can add one, so every other name is
 still refused, and the `Origin` must still name the same server. Everything above about what the colony
@@ -660,6 +766,7 @@ server/
   harnesses/   one adapter per agent harness — README.md is the contract
     index.mjs    the registry: add your harness to the list here
     claude-code.mjs
+    claude-cowork.mjs   (this fork)
   lib/         filesystem helpers the adapters share
   scan.mjs     harness-agnostic: asks every detected harness, merges, sorts
   api.mjs      /api/threads, /api/harnesses, /api/state, /api/open, /api/new-session,
@@ -710,10 +817,15 @@ Built by **[Jarren Rocks](https://jarren.rocks)**, mostly as a side effect of bu
 **[Emra](https://emra.app)** — which is where most of the threads in the screenshots come from,
 and why a tool for keeping track of a lot of them at once existed in the first place.
 
+This fork is maintained by **[AS Media Group](https://github.com/AS-Media-Group)**. Credit
+for the idea, the colony and nearly all of the code belongs to the original author. The fork
+only adds the changes listed in [What this fork changes](#what-this-fork-changes).
+
 ## Licence
 
 [MIT](LICENSE) © Jarren Rocks. Do what you like with it — including forking it, which
 [CONTRIBUTING.md](CONTRIBUTING.md) explains is a first-class option rather than a last resort.
+The changes made in this fork are released under the same MIT licence.
 
 The art is not mine. Three CC0 packs by **[Kay Lousberg](https://kaylousberg.com)** — [Space
 Base Bits](https://kaylousberg.itch.io/space-base-bits), [Character
@@ -730,3 +842,4 @@ Everything else you see — the shaders, the terrain, the sky, the ship, the cre
 faces, the plot decks and their kerbs — is drawn by this project and is MIT along with the code.
 
 Not affiliated with Anthropic, OpenAI, Google, or any of the other harness vendors listed above.
+This fork is independent of the original author, who has not reviewed or endorsed its changes.
