@@ -145,11 +145,15 @@ const actions = {
   /** The usage panel just opened: count now rather than waiting for the next poll. */
   usageOpened: () => refreshUsage(),
 
-  /** A placeholder row shows at once; the real answer replaces it once Jarvis comes back. */
+  /**
+   * A placeholder row shows at once, and this keeps its own reference to fill in — asking a
+   * second question before the first answers must not let the two replies land on each other's
+   * rows.
+   */
   askJarvis: async (question) => {
-    hud.addJarvisTurn(question, { text: '…', lane: '', ms: 0 })
+    const row = hud.addJarvisTurn(question, { text: '…', lane: '', ms: 0 })
     const reply = await askJarvis(question)
-    hud.replaceLastJarvisTurn(question, reply)
+    hud.fillJarvisTurn(row, question, reply)
   },
 
   focusThread: (id) => select(id, { fly: true }),
@@ -548,6 +552,9 @@ window.addEventListener('keydown', (e) => {
       break
     case 'j':
     case 'J':
+      // Opening the panel focuses its input in the same keystroke — without this the browser's
+      // own default action for the key lands the "j" in the box it just focused.
+      e.preventDefault()
       hud.toggleJarvis()
       break
     case 'n':

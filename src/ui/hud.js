@@ -416,6 +416,15 @@ export class Hud {
       input.value = ''
       this.actions.askJarvis?.(question)
     })
+    // Enter submits explicitly, exactly once: preventDefault stops the browser's own implicit
+    // submission for a lone text input, so requestSubmit is never fired twice for one keystroke.
+    // Guarded on isComposing so committing an IME candidate with Enter does not fire early.
+    this.$('.jarvis input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.isComposing) {
+        e.preventDefault()
+        this.$('.j-ask').requestSubmit()
+      }
+    })
     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
@@ -972,6 +981,9 @@ export class Hud {
   /**
    * One exchange in the log: what was asked, and what came back. Every value goes in through
    * textContent — an answer can quote a file, and a file can contain anything.
+   *
+   * Returns the row, so the caller can fill in *that* row once the real reply arrives — a
+   * second question asked before the first answers must not land on the wrong placeholder.
    */
   addJarvisTurn(question, reply) {
     const log = this.$('.jarvis .j-log')
@@ -979,17 +991,12 @@ export class Hud {
     row.className = 'j-turn'
     row.innerHTML = `<div class="q"></div><div class="a"></div><div class="meta"></div>`
     log.appendChild(row)
-    this._fillJarvisTurn(row, question, reply)
+    this.fillJarvisTurn(row, question, reply)
+    return row
   }
 
-  /** The placeholder row shown while Jarvis thinks, filled in once the answer arrives. */
-  replaceLastJarvisTurn(question, reply) {
-    const row = this.$('.jarvis .j-log').lastElementChild
-    if (row) this._fillJarvisTurn(row, question, reply)
-    else this.addJarvisTurn(question, reply)
-  }
-
-  _fillJarvisTurn(row, question, reply) {
+  /** Fills one turn's row — the placeholder while Jarvis thinks, or the answer once it arrives. */
+  fillJarvisTurn(row, question, reply) {
     row.querySelector('.q').textContent = question
     row.querySelector('.a').textContent = reply.text
     row.querySelector('.meta').textContent = reply.lane ? `${reply.lane} · ${reply.ms} ms` : 'thinking…'
