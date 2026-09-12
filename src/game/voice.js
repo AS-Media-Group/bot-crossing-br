@@ -120,9 +120,9 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   }
 
   /**
-   * Chrome (measured: blocked on every window open in the spike) leaves `resume()` on a context the
-   * autoplay policy refused to start permanently pending — it never rejects. Racing it against a
-   * timeout is the only way to find out "not yet" without hanging every reconnect's onopen forever.
+   * Chrome leaves `resume()` on a context the autoplay policy refused to start permanently pending —
+   * it never rejects (seen on every fresh window open). Racing it against a timeout is the only way
+   * to find out "not yet" without hanging every reconnect's onopen forever.
    */
   async function audioReady() {
     ctx ??= new AudioContext()

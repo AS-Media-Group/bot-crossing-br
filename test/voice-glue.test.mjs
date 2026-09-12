@@ -323,7 +323,7 @@ test('a 4001 close reads as taken, survives a mute toggle with no socket, and or
   }
 })
 
-test("a stale socket's late close does not clobber the socket that replaced it (cheap fix)", async () => {
+test("a stale socket's late close does not clobber the socket that replaced it", async () => {
   const fakes = installFakes({ ctxRunning: true })
   try {
     const voice = createVoice({ url: 'ws://fake/voice', onState: () => {} })
