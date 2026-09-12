@@ -129,6 +129,14 @@ Claude Code:
 Design notes and plans for the larger changes are in
 [`docs/superpowers/`](docs/superpowers/).
 
+### Jarvis, when it is there
+
+- **A panel that only shows up if you have it.** Jarvis is a separate private assistant
+  service that may or may not be running on this machine. The colony asks its health check
+  on boot, and the panel — and the bar button that opens it — appear only when that answers.
+  Bot Crossing itself stays read-only and never runs a model; it just posts a question to
+  `localhost` and shows whatever comes back.
+
 ### Keeping up with upstream
 
 ```bash
@@ -406,6 +414,7 @@ under **View → Return to isometric**.
 | `H` / `⌘\` | **Hide every panel.** The colony still reads: status lives above the astronauts' heads. *(This fork:)* the floating bar stays, and its panels button brings them back |
 | `S` | Settings |
 | `U` | Claude usage |
+| `J` | Ask Jarvis |
 | `N` | Fly to the next astronaut waiting on you |
 | `Enter` / `A` | Open / archive the selected thread |
 | `V` | Mark the selected thread viewed, so it stops asking |

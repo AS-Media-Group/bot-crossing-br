@@ -20,6 +20,7 @@ import {
   revealFolder,
 } from './game/api.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
+import { askJarvis, jarvisHealth } from './game/jarvis.js'
 
 /**
  * Boot and the outer game loop.
@@ -143,6 +144,13 @@ const actions = {
 
   /** The usage panel just opened: count now rather than waiting for the next poll. */
   usageOpened: () => refreshUsage(),
+
+  /** A placeholder row shows at once; the real answer replaces it once Jarvis comes back. */
+  askJarvis: async (question) => {
+    hud.addJarvisTurn(question, { text: '…', lane: '', ms: 0 })
+    const reply = await askJarvis(question)
+    hud.replaceLastJarvisTurn(question, reply)
+  },
 
   focusThread: (id) => select(id, { fly: true }),
 
@@ -538,6 +546,10 @@ window.addEventListener('keydown', (e) => {
     case 'U':
       hud.toggleUsage()
       break
+    case 'j':
+    case 'J':
+      hud.toggleJarvis()
+      break
     case 'n':
     case 'N':
       actions.focusStatus('waiting')
@@ -791,6 +803,8 @@ async function boot() {
   if (!kitError) colony.onAssetsReady()
 
   await poll()
+  // Jarvis is a separate private service; the panel only ever shows once it answers a health check.
+  hud.setJarvisAvailable(await jarvisHealth())
   setInterval(poll, POLL_MS)
   window.addEventListener('focus', poll)
   // A tab that was hidden for an hour should catch up the moment it comes back.

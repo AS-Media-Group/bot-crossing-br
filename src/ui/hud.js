@@ -51,6 +51,7 @@ const ICON = {
   locate: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7.6"/><path d="M12 1.8v2.6M12 19.6v2.6M1.8 12h2.6M19.6 12h2.6"/></svg>`,
   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
   panels: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>`,
+  jarvis: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/><path d="M9 11h.01M12 11h.01M15 11h.01"/></svg>`,
 }
 
 const STAT_DEFS = [
@@ -400,7 +401,21 @@ export class Hud {
       if (!this.visible) this.toggleUi(true)
       this.toggleUsage()
     })
+    // Same bargain as usage and settings: the panel lives in the HUD, so the panels come back first.
+    onBar('#bar-jarvis', () => {
+      if (!this.visible) this.toggleUi(true)
+      this.toggleJarvis()
+    })
     on('#btn-close-usage', 'click', () => this.toggleUsage(false))
+    on('#btn-close-jarvis', 'click', () => this.toggleJarvis(false))
+    this.$('.j-ask').addEventListener('submit', (e) => {
+      e.preventDefault()
+      const input = this.$('.jarvis input')
+      const question = input.value.trim()
+      if (!question) return
+      input.value = ''
+      this.actions.askJarvis?.(question)
+    })
     on('#btn-hidden-toggle', 'click', () => this.toggleHiddenList())
     on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
@@ -437,6 +452,12 @@ export class Hud {
       chipEl.title = chip.title
       chipEl.classList.toggle('stale', chip.stale)
     }
+  }
+
+  /** The panel exists only when the service answered a health check. */
+  setJarvisAvailable(on) {
+    this.jarvisReady = Boolean(on)
+    this.bar.querySelector('#bar-jarvis').hidden = !on
   }
 
   /** Whether the panel is on screen — the page only counts tokens while somebody is looking. */
@@ -907,7 +928,11 @@ export class Hud {
     this.$('#btn-settings').setAttribute('aria-pressed', String(open))
     // Both live in the same slot on the right; the sidebar steps aside rather than hides.
     this.$('.side').classList.toggle('shifted', open)
-    if (open) this.toggleUsage(false)
+    if (open) {
+      this.toggleUsage(false)
+      this.$('.jarvis').classList.add('closed')
+      this.bar.querySelector('#bar-jarvis').setAttribute('aria-pressed', 'false')
+    }
   }
 
   /** Usage shares the slot settings uses, so only one of the two is ever open. */
@@ -920,8 +945,57 @@ export class Hud {
     if (open) {
       this.$('.settings').classList.add('closed')
       this.$('#btn-settings').setAttribute('aria-pressed', 'false')
+      this.$('.jarvis').classList.add('closed')
+      this.bar.querySelector('#bar-jarvis').setAttribute('aria-pressed', 'false')
       this.actions.usageOpened?.()
     }
+  }
+
+  /** Settings, Usage and Jarvis share one slot on the right, so opening one closes the others. */
+  toggleJarvis(force) {
+    if (!this.jarvisReady) return
+    const panel = this.$('.jarvis')
+    const open = force ?? panel.classList.contains('closed')
+    panel.classList.toggle('closed', !open)
+    this.bar.querySelector('#bar-jarvis').setAttribute('aria-pressed', String(open))
+    if (open) {
+      this.$('.settings').classList.add('closed')
+      this.$('#btn-settings').setAttribute('aria-pressed', 'false')
+      this.$('.usage').classList.add('closed')
+      this.bar.querySelector('#bar-usage').setAttribute('aria-pressed', 'false')
+      this.$('.jarvis input').focus()
+    }
+    const anyOpen = ['.settings', '.usage', '.jarvis'].some((sel) => !this.$(sel).classList.contains('closed'))
+    this.$('.side').classList.toggle('shifted', anyOpen)
+  }
+
+  /**
+   * One exchange in the log: what was asked, and what came back. Every value goes in through
+   * textContent — an answer can quote a file, and a file can contain anything.
+   */
+  addJarvisTurn(question, reply) {
+    const log = this.$('.jarvis .j-log')
+    const row = document.createElement('div')
+    row.className = 'j-turn'
+    row.innerHTML = `<div class="q"></div><div class="a"></div><div class="meta"></div>`
+    log.appendChild(row)
+    this._fillJarvisTurn(row, question, reply)
+  }
+
+  /** The placeholder row shown while Jarvis thinks, filled in once the answer arrives. */
+  replaceLastJarvisTurn(question, reply) {
+    const row = this.$('.jarvis .j-log').lastElementChild
+    if (row) this._fillJarvisTurn(row, question, reply)
+    else this.addJarvisTurn(question, reply)
+  }
+
+  _fillJarvisTurn(row, question, reply) {
+    row.querySelector('.q').textContent = question
+    row.querySelector('.a').textContent = reply.text
+    row.querySelector('.meta').textContent = reply.lane ? `${reply.lane} · ${reply.ms} ms` : 'thinking…'
+    row.classList.toggle('error', reply.lane === 'error')
+    const log = this.$('.jarvis .j-log')
+    log.scrollTop = log.scrollHeight
   }
 
   toggleHelp(force) {
@@ -1071,6 +1145,7 @@ const BAR_TEMPLATE = `
 <div class="stats"></div>
 <div class="sep"></div>
 <button class="btn ghost usage-chip" id="bar-usage" hidden title="Claude usage (U)"><span class="txt"></span></button>
+<button class="btn icon ghost" id="bar-jarvis" hidden title="Ask Jarvis (J)">${ICON.jarvis}</button>
 <button class="btn icon ghost" id="bar-panels" title="Hide the panels (H)" aria-pressed="true">${ICON.panels}</button>
 <button class="btn icon ghost" id="bar-next" title="Next astronaut waiting on you (N)">${ICON.next}</button>
 <button class="btn icon ghost" id="bar-home" title="Reset the view (0)">${ICON.home}</button>
@@ -1142,6 +1217,12 @@ const TEMPLATE = `
   <div class="body"></div>
 </div>
 
+<div class="jarvis panel closed">
+  <header>Jarvis <button class="btn icon ghost" id="btn-close-jarvis" title="Close">${ICON.close}</button></header>
+  <div class="body"><div class="j-log"></div></div>
+  <form class="j-ask"><input type="text" placeholder="Ask Jarvis…" autocomplete="off" /></form>
+</div>
+
 <div class="thread-pop panel">
   <i class="nib"></i>
   <div class="top">
@@ -1179,6 +1260,7 @@ const TEMPLATE = `
         <div class="k"><span>Hide all UI</span><kbd>H</kbd> <kbd>${IS_MAC ? '⌘' : 'Ctrl'}\\</kbd></div>
         <div class="k"><span>Settings</span><kbd>S</kbd></div>
         <div class="k"><span>Claude usage</span><kbd>U</kbd></div>
+        <div class="k"><span>Ask Jarvis</span><kbd>J</kbd></div>
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
       </div>
       <div>

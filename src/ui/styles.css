@@ -204,7 +204,8 @@ body {
 /* ── settings ────────────────────────────────────────────────────────────────────── */
 
 .settings,
-.usage {
+.usage,
+.jarvis {
   position: absolute;
   /* Level with the sidebar it sits beside. The old 78px was clearing a top bar that no
      longer exists. */
@@ -219,14 +220,16 @@ body {
 }
 
 .settings.closed,
-.usage.closed {
+.usage.closed,
+.jarvis.closed {
   transform: translateX(calc(100% + 20px));
   opacity: 0;
   pointer-events: none;
 }
 
 .settings header,
-.usage header {
+.usage header,
+.jarvis header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -237,7 +240,8 @@ body {
 }
 
 .settings .body,
-.usage .body {
+.usage .body,
+.jarvis .body {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 16px 16px;
@@ -247,12 +251,14 @@ body {
 }
 
 .settings .body::-webkit-scrollbar,
-.usage .body::-webkit-scrollbar {
+.usage .body::-webkit-scrollbar,
+.jarvis .body::-webkit-scrollbar {
   width: 8px;
 }
 
 .settings .body::-webkit-scrollbar-thumb,
-.usage .body::-webkit-scrollbar-thumb {
+.usage .body::-webkit-scrollbar-thumb,
+.jarvis .body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.14);
   border-radius: 8px;
 }
@@ -1430,7 +1436,8 @@ kbd {
 
 @media (max-width: 820px) {
   .settings,
-  .usage {
+  .usage,
+  .jarvis {
     width: min(306px, calc(100vw - 28px));
   }
   .side {
@@ -1465,7 +1472,8 @@ kbd {
   }
   .side,
   .settings,
-  .usage {
+  .usage,
+  .jarvis {
     bottom: calc(72px + env(safe-area-inset-bottom, 0px));
   }
   .toasts,
@@ -1610,4 +1618,63 @@ kbd {
 
 .usage-none code {
   font-size: 10.5px;
+}
+
+/* ── Jarvis ────────────────────────────────────────────────────────────────────
+   A log of question and answer, and a box to ask the next one. The answers are written to be
+   spoken, so they are short; the log is for reading back, not for long documents. */
+
+.jarvis .body {
+  display: flex;
+  flex-direction: column;
+}
+
+.j-log {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 12.5px;
+}
+
+.j-turn .q {
+  color: var(--ink-3, #8a8d98);
+  margin-bottom: 3px;
+}
+
+.j-turn .a {
+  line-height: 1.5;
+}
+
+.j-turn.error .a {
+  color: #e88b8b;
+}
+
+.j-turn .meta {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--ink-3, #8a8d98);
+  font-variant-numeric: tabular-nums;
+}
+
+.j-ask {
+  padding: 10px 16px 14px;
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+}
+
+.j-ask input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+}
+
+.j-ask input:focus {
+  outline: none;
+  border-color: #6f9ff0;
 }
