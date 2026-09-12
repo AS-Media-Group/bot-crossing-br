@@ -9,9 +9,16 @@ class JarvisMic extends AudioWorkletProcessor {
     this.size = options?.processorOptions?.chunk || 960
     this.buf = new Float32Array(this.size)
     this.n = 0
+    this.stopped = false
+    // stopMic() posts this before disconnecting, so the processor retires itself rather than being
+    // torn down mid-callback.
+    this.port.onmessage = (e) => {
+      if (e.data?.stop) this.stopped = true
+    }
   }
 
   process(inputs) {
+    if (this.stopped) return false
     const channel = inputs[0]?.[0]
     if (channel) {
       for (let i = 0; i < channel.length; i++) {

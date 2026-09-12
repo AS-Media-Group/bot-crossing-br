@@ -90,20 +90,26 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   let ctx = null
   let workletLoaded = false
   let mic = null // { stream, source, node }
+  let starting = null // startMic is single-flight: the in-flight promise, or null
+  let waking = null // wakeAudio is single-flight too, for the same reason
+  let pointerWaiting = false // at most one pointerdown listener queued at a time
   let muted = readMuted()
   let attempt = 0
   let retry = null
   let server = { state: 'disconnected' } // the last state Jarvis sent (or the connection's own)
   let overlay = null // a local problem Jarvis cannot see: 'needs-click' or 'blocked'
+  let taken = false // set only by a 4001 close; kept apart from `server` so muting never masks it
   let state = 'disconnected'
   let incoming = null // { id, rate }: the say whose audio is arriving
   let sources = []
   let playhead = 0
   let playedTimers = []
 
+  // `taken` wins over everything else — a window that lost the mic stays visibly "taken" no matter
+  // what Jarvis or a local mute does next, until orbClicked asks to reconnect.
   const show = () => {
-    state = overlay ?? server.state
-    onState(state, overlay ? undefined : server.reason)
+    state = taken ? 'taken' : overlay ?? server.state
+    onState(state, taken || overlay ? undefined : server.reason)
   }
   const setServer = (s, reason) => {
     server = { state: s, reason }
@@ -113,20 +119,35 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
   }
 
+  /**
+   * Chrome (measured: blocked on every window open in the spike) leaves `resume()` on a context the
+   * autoplay policy refused to start permanently pending — it never rejects. Racing it against a
+   * timeout is the only way to find out "not yet" without hanging every reconnect's onopen forever.
+   */
   async function audioReady() {
     ctx ??= new AudioContext()
-    if (ctx.state !== 'running') {
-      try {
-        await ctx.resume()
-      } catch {
-        // Needs a click first (the browser's autoplay rule).
-      }
-    }
+    if (ctx.state === 'running') return true
+    const resumed = ctx.resume().catch(() => {})
+    await Promise.race([resumed, new Promise((r) => setTimeout(r, 250))])
     return ctx.state === 'running'
   }
 
-  async function startMic() {
+  function startMic() {
+    if (starting) return starting
+    starting = doStartMic().finally(() => {
+      starting = null
+    })
+    return starting
+  }
+
+  /**
+   * Single-flight and re-checked after every await: two callers racing to wake the mic (the
+   * pointerdown listener and a click on the orb, say) must not open two capture graphs, and muting
+   * or losing the socket mid-setup must not leave an orphan graph or a leaked stream.
+   */
+  async function doStartMic() {
     if (mic || muted || !ws) return
+    const sock = ws // the start is only still wanted while this exact socket is the live one
     let stream
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -136,27 +157,38 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
       overlay = 'blocked'
       return show()
     }
-    if (mic || muted || !ws) {
-      stream.getTracks().forEach((t) => t.stop()) // muted or disconnected while the prompt was up
+    if (mic || muted || ws !== sock) {
+      stream.getTracks().forEach((t) => t.stop()) // muted, closed, or beaten to it while the prompt was up
       return
     }
-    if (!workletLoaded) {
-      await ctx.audioWorklet.addModule('/mic-worklet.js')
-      workletLoaded = true
+    try {
+      if (!workletLoaded) {
+        await ctx.audioWorklet.addModule('/mic-worklet.js')
+        workletLoaded = true
+      }
+      if (mic || muted || ws !== sock) {
+        stream.getTracks().forEach((t) => t.stop())
+        return
+      }
+      const source = ctx.createMediaStreamSource(stream)
+      const node = new AudioWorkletNode(ctx, 'jarvis-mic', { processorOptions: { chunk: Math.round(ctx.sampleRate / 50) } })
+      const down = createDownsampler(ctx.sampleRate)
+      node.port.onmessage = (e) => {
+        if (ws?.readyState === WebSocket.OPEN && !muted) ws.send(down(e.data).buffer)
+      }
+      source.connect(node)
+      node.connect(ctx.destination) // silent: the worklet only runs while it reaches the speakers
+      mic = { stream, source, node }
+      if (overlay === 'blocked') overlay = null
+      show()
+    } catch {
+      stream.getTracks().forEach((t) => t.stop()) // addModule rejected, or the graph failed to build
     }
-    const source = ctx.createMediaStreamSource(stream)
-    const node = new AudioWorkletNode(ctx, 'jarvis-mic', { processorOptions: { chunk: Math.round(ctx.sampleRate / 50) } })
-    const down = createDownsampler(ctx.sampleRate)
-    node.port.onmessage = (e) => {
-      if (ws?.readyState === WebSocket.OPEN && !muted) ws.send(down(e.data).buffer)
-    }
-    source.connect(node)
-    node.connect(ctx.destination) // silent: the worklet only runs while it reaches the speakers
-    mic = { stream, source, node }
   }
 
   function stopMic() {
     if (!mic) return
+    mic.node.port.postMessage({ stop: true })
     mic.stream.getTracks().forEach((t) => t.stop()) // Chrome's mic indicator goes out
     mic.node.port.onmessage = null
     mic.source.disconnect()
@@ -184,8 +216,8 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
 
   /**
    * `played` means the speaker has actually gone quiet — only then may Jarvis listen again. Plus
-   * 300 ms: Chrome's echo cancellation was measured not to remove Jarvis's own voice from the MacBook
-   * mic (ratio 19× with it on), so the room's echo gets time to die away first (ruling R6).
+   * 300 ms: the browser's echo cancellation does not fully remove Jarvis's own voice from the mic,
+   * so the room's echo gets time to die away first.
    */
   function finished(id) {
     const left = ctx ? Math.max(0, playhead - ctx.currentTime) : 0
@@ -224,36 +256,70 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     else if (msg.type === 'hush') stopPlayback()
   }
 
-  async function wakeAudio() {
+  function wakeAudio() {
+    if (waking) return waking
+    waking = doWakeAudio().finally(() => {
+      waking = null
+    })
+    return waking
+  }
+
+  // Clears the 'needs-click' overlay only once the context is actually running — a second wake
+  // racing this one (a queued pointerdown plus a click on the orb) shares this same promise instead
+  // of opening its own capture graph.
+  async function doWakeAudio() {
     if (!(await audioReady())) return
     if (overlay === 'needs-click') overlay = null
     show()
-    startMic()
+    await startMic()
+  }
+
+  function addPointerWake() {
+    if (pointerWaiting) return // one queued listener is enough; don't stack another
+    pointerWaiting = true
+    document.addEventListener(
+      'pointerdown',
+      () => {
+        pointerWaiting = false
+        wakeAudio().catch(() => {})
+      },
+      { once: true },
+    )
   }
 
   function connect() {
     clearTimeout(retry)
-    ws = new WebSocket(url)
-    ws.binaryType = 'arraybuffer'
-    ws.onopen = async () => {
+    const sock = new WebSocket(url) // bound to its own handlers below, so a stale socket can never touch `ws`
+    ws = sock
+    sock.binaryType = 'arraybuffer'
+    sock.onopen = async () => {
+      if (sock !== ws) return
       attempt = 0
       send({ type: 'hello', v: 1 })
       if (muted) send({ type: 'mute', on: true })
       onReconnect()
       if (!(await audioReady())) {
+        if (sock !== ws) return
         overlay = 'needs-click'
         show()
-        document.addEventListener('pointerdown', wakeAudio, { once: true })
+        addPointerWake()
         return
       }
-      startMic()
+      startMic().catch(() => {})
     }
-    ws.onmessage = onMessage
-    ws.onclose = (e) => {
+    sock.onmessage = (e) => {
+      if (sock !== ws) return
+      onMessage(e)
+    }
+    sock.onclose = (e) => {
+      if (sock !== ws) return // a superseded socket closing late must not null the socket that replaced it
       ws = null
       stopMic()
       stopPlayback()
-      if (e.code === 4001) return setServer('taken') // another window has the mic: never grab it back unasked
+      if (e.code === 4001) {
+        taken = true // another window has the mic: never grab it back unasked
+        return show()
+      }
       setServer('disconnected')
       retry = setTimeout(connect, backoffMs(attempt++))
     }
@@ -273,25 +339,29 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     toggleMute() {
       muted = !muted
       writeMuted(muted)
-      send({ type: 'mute', on: muted })
       if (muted) {
         stopMic()
         stopPlayback()
-        setServer('muted')
+      }
+      // The mute preference is always recorded. But the server-side 'muted' state is only ours to set
+      // while there is a socket to back it up — with none (disconnected, or another window has the
+      // mic), setting it here would paper over 'taken' or 'disconnected'; just redraw what is true.
+      if (ws?.readyState === WebSocket.OPEN) {
+        send({ type: 'mute', on: muted })
+        if (muted) setServer('muted')
+        else startMic().catch(() => {}) // Jarvis answers with the state to show
       } else {
-        startMic() // Jarvis answers with the state to show
+        show()
       }
     },
     stop,
     async orbClicked() {
-      if (state === 'taken') {
+      if (taken) {
+        taken = false
         setServer('disconnected')
         return connect() // Jarvis hands the mic to the newest window: this one
       }
-      if (overlay) {
-        overlay = null
-        return wakeAudio()
-      }
+      if (overlay) return wakeAudio().catch(() => {})
       if (state === 'waiting') send({ type: 'listen' })
       else if (ACTIVE.has(state)) stop()
     },

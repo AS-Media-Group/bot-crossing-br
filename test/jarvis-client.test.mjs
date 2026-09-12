@@ -61,7 +61,7 @@ test('the colony learns whether Jarvis can listen, not just whether it is there'
   assert.deepEqual(typedOnly, { ok: true, voice: false })
 })
 
-test('no Jarvis, or a garbled answer, is simply "not there"', async () => {
+test('no Jarvis reads as "not there"; a garbled answer reads as "there, but can\'t listen"', async () => {
   assert.deepEqual(await withFetch(async () => { throw new Error('ECONNREFUSED') }, jarvisInfo), { ok: false, voice: false })
   assert.deepEqual(await withFetch(async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }), jarvisInfo), { ok: true, voice: false })
 })
