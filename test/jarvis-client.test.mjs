@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { askJarvis, jarvisHealth } from '../src/game/jarvis.js'
+import { askJarvis, jarvisHealth, jarvisInfo } from '../src/game/jarvis.js'
 
 const withFetch = async (impl, fn) => {
   const real = globalThis.fetch
@@ -52,4 +52,16 @@ test('a failure is a sentence, not an exception the page has to catch', async ()
   const reply = await withFetch(async () => { throw new Error('ECONNREFUSED') }, () => askJarvis('hello'))
   assert.match(reply.text, /can't reach Jarvis/i)
   assert.equal(reply.lane, 'error')
+})
+
+test('the colony learns whether Jarvis can listen, not just whether it is there', async () => {
+  const info = await withFetch(async () => ({ ok: true, json: async () => ({ ok: true, version: '0.1.0', voice: 'ready' }) }), jarvisInfo)
+  assert.deepEqual(info, { ok: true, voice: true })
+  const typedOnly = await withFetch(async () => ({ ok: true, json: async () => ({ ok: true, version: '0.1.0' }) }), jarvisInfo)
+  assert.deepEqual(typedOnly, { ok: true, voice: false })
+})
+
+test('no Jarvis, or a garbled answer, is simply "not there"', async () => {
+  assert.deepEqual(await withFetch(async () => { throw new Error('ECONNREFUSED') }, jarvisInfo), { ok: false, voice: false })
+  assert.deepEqual(await withFetch(async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }), jarvisInfo), { ok: true, voice: false })
 })

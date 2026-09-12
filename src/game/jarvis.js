@@ -7,17 +7,31 @@
  */
 const JARVIS = 'http://127.0.0.1:5281'
 
+/** The audio route: this window's microphone in, the answer's voice out. Local only, like the rest. */
+export const JARVIS_VOICE_URL = 'ws://127.0.0.1:5281/voice'
+
 /**
- * Bounded, because something that accepts the connection and never answers would otherwise leave
- * the check pending forever. A timeout reads the same as "not running": no panel.
+ * Is Jarvis there, and can it listen? Bounded, like the health check always was — something that
+ * accepts the connection and never answers reads as "not there". Never throws.
  */
-export async function jarvisHealth(timeoutMs = 2000) {
+export async function jarvisInfo(timeoutMs = 2000) {
+  let res
   try {
-    const res = await fetch(`${JARVIS}/health`, { signal: AbortSignal.timeout(timeoutMs) })
-    return res.ok
+    res = await fetch(`${JARVIS}/health`, { signal: AbortSignal.timeout(timeoutMs) })
   } catch {
-    return false
+    return { ok: false, voice: false }
   }
+  if (!res.ok) return { ok: false, voice: false }
+  try {
+    const body = await res.json()
+    return { ok: true, voice: body?.voice === 'ready' }
+  } catch {
+    return { ok: true, voice: false }
+  }
+}
+
+export async function jarvisHealth(timeoutMs = 2000) {
+  return (await jarvisInfo(timeoutMs)).ok
 }
 
 export async function askJarvis(question) {
