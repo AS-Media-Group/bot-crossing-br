@@ -811,7 +811,9 @@ async function boot() {
 
   await poll()
   // Jarvis is a separate private service; the panel only ever shows once it answers a health check.
-  hud.setJarvisAvailable(await jarvisHealth())
+  // Not awaited: the colony's own polling and listeners below must never wait on a service it does
+  // not depend on.
+  jarvisHealth().then((ok) => hud.setJarvisAvailable(ok))
   setInterval(poll, POLL_MS)
   window.addEventListener('focus', poll)
   // A tab that was hidden for an hour should catch up the moment it comes back.

@@ -7,9 +7,13 @@
  */
 const JARVIS = 'http://127.0.0.1:5281'
 
-export async function jarvisHealth() {
+/**
+ * Bounded, because something that accepts the connection and never answers would otherwise leave
+ * the check pending forever. A timeout reads the same as "not running": no panel.
+ */
+export async function jarvisHealth(timeoutMs = 2000) {
   try {
-    const res = await fetch(`${JARVIS}/health`)
+    const res = await fetch(`${JARVIS}/health`, { signal: AbortSignal.timeout(timeoutMs) })
     return res.ok
   } catch {
     return false
