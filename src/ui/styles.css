@@ -1678,3 +1678,46 @@ kbd {
   outline: none;
   border-color: #6f9ff0;
 }
+
+/* ── Jarvis's voice: one orb, the same look in the panel and as a ring on the bar button ─────── */
+.j-voice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  margin-right: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.85;
+  min-width: 0;
+}
+.j-voice[hidden] { display: none; }
+.j-voice-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.j-orb {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border-radius: 50%;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  background: #6b7280;
+  transition: background 200ms, box-shadow 200ms;
+}
+.j-orb[data-mode='waiting'] { background: #7dd3fc; opacity: 0.55; animation: j-breathe 3.2s ease-in-out infinite; }
+.j-orb[data-mode='listening'] { background: #38bdf8; box-shadow: 0 0 10px 3px rgba(56, 189, 248, 0.7); }
+.j-orb[data-mode='thinking'] { background: conic-gradient(#38bdf8, #a78bfa, #38bdf8); animation: j-spin 1s linear infinite; }
+.j-orb[data-mode='speaking'] { background: #a78bfa; animation: j-pulse 0.6s ease-in-out infinite alternate; }
+.j-orb[data-mode='followup'] { background: #38bdf8; box-shadow: 0 0 6px 2px rgba(56, 189, 248, 0.45); }
+.j-orb[data-mode='muted'],
+.j-orb[data-mode='off'] { background: #6b7280; opacity: 0.6; }
+#bar-jarvis[data-voice='listening'],
+#bar-jarvis[data-voice='followup'] { box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.8); }
+#bar-jarvis[data-voice='thinking'],
+#bar-jarvis[data-voice='speaking'] { box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.8); }
+@keyframes j-breathe { 50% { opacity: 0.9; } }
+@keyframes j-spin { to { transform: rotate(1turn); } }
+@keyframes j-pulse { to { transform: scale(1.18); } }
+@media (prefers-reduced-motion: reduce) {
+  .j-orb { animation: none !important; }
+}

@@ -20,7 +20,8 @@ import {
   revealFolder,
 } from './game/api.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
-import { askJarvis, jarvisHealth } from './game/jarvis.js'
+import { askJarvis, jarvisInfo, JARVIS_VOICE_URL } from './game/jarvis.js'
+import { createVoice, orbFor } from './game/voice.js'
 
 /**
  * Boot and the outer game loop.
@@ -69,6 +70,51 @@ let hoverId = null
 let statusCursor = 0
 let pendingSave = 0
 const hoverGround = new THREE.Vector3()
+
+// ── Jarvis's voice ──────────────────────────────────────────────────────────────────────
+
+let voice = null
+let voiceTurn = null // { row, text }: the spoken question waiting for its answer
+let jarvisWatch = null
+
+function startVoice() {
+  if (voice) return
+  voice = createVoice({
+    url: JARVIS_VOICE_URL,
+    onState: (state, reason) => hud.setVoiceState(orbFor(state, reason), voice?.muted() ?? false),
+    onHeard: (text) => {
+      hud.openJarvisForVoice()
+      voiceTurn = { text, row: hud.addJarvisTurn(text, { text: '…', lane: '', ms: 0 }) }
+    },
+    onAnswer: (reply) => {
+      if (!voiceTurn) return
+      hud.fillJarvisTurn(voiceTurn.row, voiceTurn.text, reply)
+      voiceTurn = null
+    },
+    // Each time the audio connection comes back, check Jarvis again: it may have been reinstalled.
+    onReconnect: () => checkJarvis(),
+  })
+  hud.setVoiceAvailable(true)
+  voice.start()
+}
+
+/**
+ * Jarvis is a separate private service; the panel only ever shows once it answers a health check.
+ * Checked now and every 30 s until it answers — so starting Jarvis after the colony no longer needs
+ * a reload (a Phase 1 limitation) — and again whenever the voice connection comes back. Never awaited
+ * by anything the colony depends on, and jarvisInfo never throws.
+ */
+async function checkJarvis() {
+  const info = await jarvisInfo()
+  hud.setJarvisAvailable(info.ok)
+  if (info.ok && info.voice) startVoice()
+  if (info.ok) {
+    clearInterval(jarvisWatch)
+    jarvisWatch = null
+  } else if (!jarvisWatch) {
+    jarvisWatch = setInterval(checkJarvis, 30000)
+  }
+}
 
 // ── actions the HUD can trigger ────────────────────────────────────────────────────────
 
@@ -155,6 +201,9 @@ const actions = {
     const reply = await askJarvis(question)
     hud.fillJarvisTurn(row, question, reply)
   },
+
+  voiceOrb: () => voice?.orbClicked(),
+  voiceMute: () => voice?.toggleMute(),
 
   focusThread: (id) => select(id, { fly: true }),
 
@@ -557,6 +606,13 @@ window.addEventListener('keydown', (e) => {
       e.preventDefault()
       hud.toggleJarvis()
       break
+    case 'm':
+    case 'M':
+      if (voice) {
+        e.preventDefault()
+        voice.toggleMute()
+      }
+      break
     case 'n':
     case 'N':
       actions.focusStatus('waiting')
@@ -626,7 +682,8 @@ window.addEventListener('keydown', (e) => {
       break
     // One step at a time, outward: the thread, then the zone it belongs to.
     case 'Escape':
-      if (document.querySelector('.help.open')) hud.toggleHelp(false)
+      if (voice?.isActive()) voice.stop()
+      else if (document.querySelector('.help.open')) hud.toggleHelp(false)
       else if (selectedId) select(null, {})
       else if (selectedProject) actions.closeProject()
       break
@@ -810,10 +867,8 @@ async function boot() {
   if (!kitError) colony.onAssetsReady()
 
   await poll()
-  // Jarvis is a separate private service; the panel only ever shows once it answers a health check.
-  // Not awaited: the colony's own polling and listeners below must never wait on a service it does
-  // not depend on.
-  jarvisHealth().then((ok) => hud.setJarvisAvailable(ok))
+  // Not awaited: the colony's own polling must never wait on a service it does not depend on.
+  checkJarvis()
   setInterval(poll, POLL_MS)
   window.addEventListener('focus', poll)
   // A tab that was hidden for an hour should catch up the moment it comes back.

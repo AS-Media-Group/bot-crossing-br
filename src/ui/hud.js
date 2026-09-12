@@ -52,6 +52,8 @@ const ICON = {
   orbit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10.2" ry="4.6" transform="rotate(-24 12 12)"/><circle cx="21" cy="8.2" r="1.5" fill="currentColor" stroke="none"/></svg>`,
   panels: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>`,
   jarvis: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/><path d="M9 11h.01M12 11h.01M15 11h.01"/></svg>`,
+  mic: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>`,
+  micOff: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16"/></svg>`,
 }
 
 const STAT_DEFS = [
@@ -408,6 +410,8 @@ export class Hud {
     })
     on('#btn-close-usage', 'click', () => this.toggleUsage(false))
     on('#btn-close-jarvis', 'click', () => this.toggleJarvis(false))
+    on('.j-orb', 'click', () => this.actions.voiceOrb?.())
+    on('#btn-jarvis-mic', 'click', () => this.actions.voiceMute?.())
     this.$('.j-ask').addEventListener('submit', (e) => {
       e.preventDefault()
       const input = this.$('.jarvis input')
@@ -467,6 +471,33 @@ export class Hud {
   setJarvisAvailable(on) {
     this.jarvisReady = Boolean(on)
     this.bar.querySelector('#bar-jarvis').hidden = !on
+  }
+
+  /** Voice controls appear only when Jarvis says it can listen. */
+  setVoiceAvailable(on) {
+    this.$('.j-voice').hidden = !on
+    if (!on) delete this.bar.querySelector('#bar-jarvis').dataset.voice
+  }
+
+  /** One look in two places: the orb in the panel, and a ring on the bar's Jarvis button. */
+  setVoiceState({ mode, label }, muted) {
+    const orb = this.$('.j-orb')
+    orb.dataset.mode = mode
+    orb.title = label
+    this.$('.j-voice-label').textContent = label
+    const bar = this.bar.querySelector('#bar-jarvis')
+    bar.dataset.voice = mode
+    bar.title = `Ask Jarvis (J) — ${label}`
+    const mic = this.$('#btn-jarvis-mic')
+    mic.innerHTML = muted ? ICON.micOff : ICON.mic
+    mic.title = muted ? 'Unmute the mic (M)' : 'Mute the mic (M)'
+    mic.setAttribute('aria-pressed', String(Boolean(muted)))
+  }
+
+  /** A spoken question lands in the panel like a typed one — opened, so the words can be seen. */
+  openJarvisForVoice() {
+    if (!this.visible) this.toggleUi(true)
+    if (this.$('.jarvis').classList.contains('closed')) this.toggleJarvis(true, { focus: false })
   }
 
   /** Whether the panel is on screen — the page only counts tokens while somebody is looking. */
@@ -961,7 +992,7 @@ export class Hud {
   }
 
   /** Settings, Usage and Jarvis share one slot on the right, so opening one closes the others. */
-  toggleJarvis(force) {
+  toggleJarvis(force, { focus = true } = {}) {
     if (!this.jarvisReady) return
     const panel = this.$('.jarvis')
     const open = force ?? panel.classList.contains('closed')
@@ -972,7 +1003,7 @@ export class Hud {
       this.$('#btn-settings').setAttribute('aria-pressed', 'false')
       this.$('.usage').classList.add('closed')
       this.bar.querySelector('#bar-usage').setAttribute('aria-pressed', 'false')
-      this.$('.jarvis input').focus()
+      if (focus) this.$('.jarvis input').focus()
     }
     const anyOpen = ['.settings', '.usage', '.jarvis'].some((sel) => !this.$(sel).classList.contains('closed'))
     this.$('.side').classList.toggle('shifted', anyOpen)
@@ -1225,7 +1256,7 @@ const TEMPLATE = `
 </div>
 
 <div class="jarvis panel closed">
-  <header>Jarvis <button class="btn icon ghost" id="btn-close-jarvis" title="Close">${ICON.close}</button></header>
+  <header>Jarvis <span class="j-voice" hidden><button class="j-orb" data-mode="off" aria-label="Jarvis's voice"></button><span class="j-voice-label"></span><button class="btn icon ghost" id="btn-jarvis-mic" title="Mute the mic (M)" aria-pressed="false">${ICON.mic}</button></span><button class="btn icon ghost" id="btn-close-jarvis" title="Close">${ICON.close}</button></header>
   <div class="body"><div class="j-log"></div></div>
   <form class="j-ask"><input type="text" placeholder="Ask Jarvis…" autocomplete="off" /></form>
 </div>
@@ -1268,6 +1299,7 @@ const TEMPLATE = `
         <div class="k"><span>Settings</span><kbd>S</kbd></div>
         <div class="k"><span>Claude usage</span><kbd>U</kbd></div>
         <div class="k"><span>Ask Jarvis</span><kbd>J</kbd></div>
+        <div class="k"><span>Mute Jarvis’s mic</span><kbd>M</kbd></div>
         <div class="k"><span>Screenshot</span><kbd>P</kbd></div>
       </div>
       <div>

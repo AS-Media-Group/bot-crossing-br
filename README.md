@@ -136,6 +136,10 @@ Design notes and plans for the larger changes are in
   on boot, and the panel — and the bar button that opens it — appear only when that answers.
   Bot Crossing itself stays read-only and never runs a model; it just posts a question to
   `localhost` and shows whatever comes back.
+- **It can listen, if it is set up to.** When the local assistant says it can take audio, the panel
+  shows an orb: say "Hey Jarvis" (or click the orb), ask, and the answer is spoken and written in the
+  panel. The microphone only goes to that local service while a colony window is open; `M` mutes it
+  (Chrome's mic light goes out) and `Esc` stops it talking. Only one window listens at a time.
 
 ### Keeping up with upstream
 
@@ -415,6 +419,7 @@ under **View → Return to isometric**.
 | `S` | Settings |
 | `U` | Claude usage |
 | `J` | Ask Jarvis |
+| `M` | Mute Jarvis's microphone |
 | `N` | Fly to the next astronaut waiting on you |
 | `Enter` / `A` | Open / archive the selected thread |
 | `V` | Mark the selected thread viewed, so it stops asking |
