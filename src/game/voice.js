@@ -430,6 +430,9 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
         return connect() // Jarvis hands the mic to the newest window: this one
       }
       if (overlay) return wakeAudio().catch(() => {})
+      // Jarvis gave up on its voice for this connection; a fresh one starts it again. The socket's
+      // own onclose reconnects, with the normal backoff.
+      if (state === 'unavailable') return ws?.close()
       if (state === 'waiting') send({ type: 'listen' })
       else if (ACTIVE.has(state)) stop()
     },

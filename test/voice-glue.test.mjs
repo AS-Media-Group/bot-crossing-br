@@ -20,13 +20,17 @@ class FakeSocket {
     this.onopen = null
     this.onmessage = null
     this.onclose = null
+    this.closeCalls = 0
     FakeSocket.instances.push(this)
   }
   send(data) {
     this.sent.push(data)
   }
   close() {
+    this.closeCalls++
+    if (this.readyState === FakeSocket.CLOSED) return
     this.readyState = FakeSocket.CLOSED
+    setTimeout(() => this.onclose?.({ code: 1005 }), 0) // a browser reports the close a moment later
   }
 }
 FakeSocket.CONNECTING = 0
@@ -452,6 +456,22 @@ test('the watchdog never restarts a mic while the audio context is not running',
     fakes.ctx.setState('suspended') // no audio arrives while suspended; that is not a dead mic
     await tick(200)
     assert.equal(fakes.getUserMediaCalls, 1)
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('clicking the orb while voice is unavailable reconnects, for a fresh start on the other side', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { voice, sock } = await connected(fakes)
+    sock.onmessage({ data: JSON.stringify({ type: 'state', state: 'unavailable', reason: 'voice is off' }) })
+
+    await voice.orbClicked()
+    assert.equal(sock.closeCalls, 1, 'the connection was closed')
+
+    await tick(600) // the close lands, then the first reconnect backoff (500 ms)
+    assert.equal(fakes.sockets.length, 2, 'a new connection was opened')
   } finally {
     fakes.restore()
   }
