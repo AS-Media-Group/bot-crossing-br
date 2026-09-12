@@ -77,12 +77,29 @@ let voice = null
 let voiceTurn = null // { row, text }: the spoken question waiting for its answer
 let jarvisWatch = null
 
+/**
+ * Stopping a question Jarvis is still thinking about (Esc, the orb, or a new wake word) means its
+ * answer never comes, so its row is closed here rather than left on "thinking…" for the next
+ * question to overwrite. Not on waiting, muted or unavailable: after a mute or a restart on the
+ * Jarvis side the pending answer still arrives (shown, not spoken) and belongs in that row.
+ */
+function closeVoiceTurn() {
+  if (!voiceTurn) return
+  hud.fillJarvisTurn(voiceTurn.row, voiceTurn.text, { text: 'Stopped.', detail: '', sources: [], lane: 'stopped' })
+  voiceTurn = null
+}
+
 function startVoice() {
   if (voice) return
   voice = createVoice({
     url: JARVIS_VOICE_URL,
-    onState: (state, reason) => hud.setVoiceState(orbFor(state, reason), voice?.muted() ?? false),
+    onState: (state, reason) => {
+      // Listening again means the old question was dropped: a new wake word, or the orb clicked.
+      if (state === 'listening') closeVoiceTurn()
+      hud.setVoiceState(orbFor(state, reason), voice?.muted() ?? false)
+    },
     onHeard: (text) => {
+      closeVoiceTurn()
       hud.openJarvisForVoice()
       voiceTurn = { text, row: hud.addJarvisTurn(text, { text: '…', lane: '', ms: 0 }) }
     },
@@ -202,7 +219,10 @@ const actions = {
     hud.fillJarvisTurn(row, question, reply)
   },
 
-  voiceOrb: () => voice?.orbClicked(),
+  voiceOrb: () => {
+    if (voice?.isActive()) closeVoiceTurn() // the click stops whatever Jarvis was doing
+    return voice?.orbClicked()
+  },
   voiceMute: () => voice?.toggleMute(),
 
   focusThread: (id) => select(id, { fly: true }),
@@ -682,8 +702,10 @@ window.addEventListener('keydown', (e) => {
       break
     // One step at a time, outward: the thread, then the zone it belongs to.
     case 'Escape':
-      if (voice?.isActive()) voice.stop()
-      else if (document.querySelector('.help.open')) hud.toggleHelp(false)
+      if (voice?.isActive()) {
+        voice.stop()
+        closeVoiceTurn()
+      } else if (document.querySelector('.help.open')) hud.toggleHelp(false)
       else if (selectedId) select(null, {})
       else if (selectedProject) actions.closeProject()
       break

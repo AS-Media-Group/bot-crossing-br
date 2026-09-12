@@ -1030,7 +1030,8 @@ export class Hud {
   fillJarvisTurn(row, question, reply) {
     row.querySelector('.q').textContent = question
     row.querySelector('.a').textContent = reply.text
-    row.querySelector('.meta').textContent = reply.lane ? `${reply.lane} · ${reply.ms} ms` : 'thinking…'
+    // A stopped voice question has a lane but no timing: just the lane, never "undefined ms".
+    row.querySelector('.meta').textContent = !reply.lane ? 'thinking…' : reply.ms === undefined ? reply.lane : `${reply.lane} · ${reply.ms} ms`
     row.classList.toggle('error', reply.lane === 'error')
     const log = this.$('.jarvis .j-log')
     log.scrollTop = log.scrollHeight
