@@ -36,7 +36,8 @@ FakeSocket.CLOSED = 3
 FakeSocket.instances = []
 
 const makeStream = () => {
-  const track = { stopped: false, stop() { track.stopped = true } }
+  // `onended` fires only when the device goes away on its own (sleep, unplugged) — never on stop().
+  const track = { stopped: false, onended: null, stop() { track.stopped = true } }
   return { getTracks: () => [track], track }
 }
 
@@ -59,6 +60,11 @@ const makeAudioContext = (startRunning) => {
       // Simulates the autoplay gesture landing: resume() would now settle for real.
       ctx.state = 'running'
       resumeResolve()
+    },
+    setState(next) {
+      // The browser moving the context on its own (sleep, a device change), as a real one reports it.
+      ctx.state = next
+      ctx.onstatechange?.()
     },
     audioWorklet: {
       addModule() {
@@ -107,10 +113,12 @@ function installFakes({ ctxRunning = false } = {}) {
   }
 
   let workletNodeCount = 0
+  const nodes = []
   globalThis.AudioWorkletNode = class FakeWorkletNode {
     constructor() {
       workletNodeCount++
       this.port = { onmessage: null, postMessage() {} }
+      nodes.push(this)
     }
     connect() {}
     disconnect() {}
@@ -168,6 +176,7 @@ function installFakes({ ctxRunning = false } = {}) {
     get workletNodeCount() {
       return workletNodeCount
     },
+    nodes,
     streams,
     sockets: FakeSocket.instances,
     firePointerdown() {
@@ -340,6 +349,109 @@ test("a stale socket's late close does not clobber the socket that replaced it",
     voice.toggleMute() // exercises `ws`: only sends if the current socket is still open
     assert.deepEqual(sock2.sent.map((s) => JSON.parse(s).type), ['mute'])
     assert.equal(sock1.sent.length, 0, "the stale socket's late close must not have nulled ws")
+  } finally {
+    fakes.restore()
+  }
+})
+
+/** Opens a socket on a running context and lets the mic graph finish building. */
+async function connected(fakes, opts = {}) {
+  const states = []
+  const voice = createVoice({ url: 'ws://fake/voice', onState: (s, r) => states.push([s, r]), ...opts })
+  voice.start()
+  const sock = fakes.sockets[0]
+  await sock.onopen()
+  await tick()
+  await tick()
+  return { voice, sock, states }
+}
+
+test('a mic track that ends on its own (sleep, a device change) is restarted with a fresh capture', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await connected(fakes)
+    assert.equal(fakes.getUserMediaCalls, 1)
+    assert.equal(fakes.workletNodeCount, 1)
+
+    fakes.streams[0].track.onended()
+    await tick()
+    await tick()
+
+    assert.equal(fakes.getUserMediaCalls, 2, 'the mic was asked for again')
+    assert.equal(fakes.workletNodeCount, 2, 'a new capture graph was built')
+    assert.equal(fakes.streams[0].track.stopped, true, 'the dead stream was let go')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a mic that cannot be restarted shows "blocked"', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { states } = await connected(fakes)
+    navigator.mediaDevices.getUserMedia = async () => {
+      throw new Error('no device')
+    }
+    fakes.streams[0].track.onended()
+    await tick()
+    await tick()
+    assert.equal(states.at(-1)[0], 'blocked')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('the audio context stopping while connected asks for a click, and clears once it runs again', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { states } = await connected(fakes)
+    assert.notEqual(states.at(-1)[0], 'needs-click')
+
+    fakes.ctx.setState('suspended')
+    assert.equal(states.at(-1)[0], 'needs-click')
+    assert.ok(fakes.hasPointerdownWaiting(), 'a click anywhere will wake it')
+
+    fakes.ctx.setState('running')
+    assert.notEqual(states.at(-1)[0], 'needs-click')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a mic that goes quiet for too long (no audio at all, not even silence) is restarted', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await connected(fakes, { micWatchdogMs: 50 })
+    assert.equal(fakes.getUserMediaCalls, 1)
+    await tick(200)
+    assert.ok(fakes.getUserMediaCalls >= 2, 'the mic was restarted')
+    assert.equal(fakes.streams[0].track.stopped, true)
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a mic that keeps delivering audio is left alone by the watchdog', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await connected(fakes, { micWatchdogMs: 50 })
+    for (let i = 0; i < 10; i++) {
+      fakes.nodes[0].port.onmessage?.({ data: new Float32Array(960) })
+      await tick(20)
+    }
+    assert.equal(fakes.getUserMediaCalls, 1)
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('the watchdog never restarts a mic while the audio context is not running', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await connected(fakes, { micWatchdogMs: 50 })
+    fakes.ctx.setState('suspended') // no audio arrives while suspended; that is not a dead mic
+    await tick(200)
+    assert.equal(fakes.getUserMediaCalls, 1)
   } finally {
     fakes.restore()
   }

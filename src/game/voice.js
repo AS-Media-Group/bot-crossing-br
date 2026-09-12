@@ -85,11 +85,12 @@ const writeMuted = (on) => {
   }
 }
 
-export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAnswer = () => {}, onReconnect = () => {} }) {
+export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAnswer = () => {}, onReconnect = () => {}, micWatchdogMs = 2000 }) {
   let ws = null
   let ctx = null
   let workletLoaded = false
-  let mic = null // { stream, source, node }
+  let mic = null // { stream, source, node, heardAt }
+  let watchdog = null // the timer that checks the mic is still delivering audio
   let starting = null // startMic is single-flight: the in-flight promise, or null
   let waking = null // wakeAudio is single-flight too, for the same reason
   let pointerWaiting = false // at most one pointerdown listener queued at a time
@@ -125,7 +126,10 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
    * to find out "not yet" without hanging every reconnect's onopen forever.
    */
   async function audioReady() {
-    ctx ??= new AudioContext()
+    if (!ctx) {
+      ctx = new AudioContext()
+      ctx.onstatechange = contextChanged
+    }
     if (ctx.state === 'running') return true
     const resumed = ctx.resume().catch(() => {})
     await Promise.race([resumed, new Promise((r) => setTimeout(r, 250))])
@@ -173,12 +177,24 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
       const source = ctx.createMediaStreamSource(stream)
       const node = new AudioWorkletNode(ctx, 'jarvis-mic', { processorOptions: { chunk: Math.round(ctx.sampleRate / 50) } })
       const down = createDownsampler(ctx.sampleRate)
+      const current = { stream, source, node, heardAt: Date.now() }
       node.port.onmessage = (e) => {
+        current.heardAt = Date.now()
         if (ws?.readyState === WebSocket.OPEN && !muted) ws.send(down(e.data).buffer)
       }
       source.connect(node)
       node.connect(ctx.destination) // silent: the worklet only runs while it reaches the speakers
-      mic = { stream, source, node }
+      mic = current
+      // The track ends on its own when the device goes away — sleep, or a headset unplugged — and
+      // the socket survives it, so without this the orb would go on inviting "Hey Jarvis" to a mic
+      // that no longer exists.
+      const [track] = stream.getTracks()
+      if (track) {
+        track.onended = () => {
+          if (mic === current) restartMic()
+        }
+      }
+      armWatchdog()
       if (overlay === 'blocked') overlay = null
       show()
     } catch {
@@ -187,13 +203,65 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   }
 
   function stopMic() {
+    clearTimeout(watchdog)
+    watchdog = null
     if (!mic) return
     mic.node.port.postMessage({ stop: true })
-    mic.stream.getTracks().forEach((t) => t.stop()) // Chrome's mic indicator goes out
+    mic.stream.getTracks().forEach((t) => {
+      t.onended = null
+      t.stop() // Chrome's mic indicator goes out
+    })
     mic.node.port.onmessage = null
     mic.source.disconnect()
     mic.node.disconnect()
     mic = null
+  }
+
+  /** A fresh capture in place of one that died. getUserMedia failing shows the 'blocked' overlay. */
+  function restartMic() {
+    stopMic()
+    startMic().catch(() => {
+      overlay = 'blocked'
+      show()
+    })
+  }
+
+  /**
+   * A mic can also stall without its track ending or the context stopping: the worklet posts a
+   * chunk every 20 ms, even of silence, so none for `micWatchdogMs` means the capture is dead.
+   * Only judged while the context runs — a suspended context delivers nothing by design, and the
+   * time it spent suspended is not counted as silence.
+   */
+  function armWatchdog() {
+    clearTimeout(watchdog)
+    watchdog = setTimeout(checkMic, micWatchdogMs)
+  }
+  function checkMic() {
+    watchdog = null
+    if (!mic) return
+    if (ctx.state !== 'running') mic.heardAt = Date.now()
+    else if (Date.now() - mic.heardAt >= micWatchdogMs) return restartMic()
+    armWatchdog()
+  }
+
+  /**
+   * The browser can stop the context on its own after sleep or a device change. While connected,
+   * that needs a click to undo (the same autoplay rule as at startup); once it runs again, the
+   * overlay clears and the mic is (re)started if there is none.
+   */
+  function contextChanged() {
+    if (ws?.readyState !== WebSocket.OPEN) return
+    if (ctx.state !== 'running') {
+      if (overlay !== 'blocked') overlay = 'needs-click' // 'blocked' already asks for a click
+      show()
+      addPointerWake()
+      return
+    }
+    if (overlay === 'needs-click') {
+      overlay = null
+      show()
+    }
+    startMic().catch(() => {})
   }
 
   function play(buf) {
