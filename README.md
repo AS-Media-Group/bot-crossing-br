@@ -134,12 +134,25 @@ Design notes and plans for the larger changes are in
 - **A panel that only shows up if you have it.** Jarvis is a separate private assistant
   service that may or may not be running on this machine. The colony asks its health check
   on boot, and the panel — and the bar button that opens it — appear only when that answers.
-  Bot Crossing itself stays read-only and never runs a model; it just posts a question to
-  `localhost` and shows whatever comes back.
-- **It can listen, if it is set up to.** When the local assistant says it can take audio, the panel
+  Bot Crossing itself stays read-only and never runs a model; it just posts a question and
+  shows whatever comes back.
+- **It can listen, if it is set up to.** When the assistant says it can take audio, the panel
   shows an orb: say "Hey Jarvis" (or click the orb), ask, and the answer is spoken and written in the
-  panel. The microphone only goes to that local service while a colony window is open; `M` mutes it
+  panel. The microphone only goes to that service while a colony window is open; `M` mutes it
   (Chrome's mic light goes out) and `Esc` stops it talking. Only one window listens at a time.
+- **Where it is set up.** The colony's own server hands the page the assistant's address and
+  bearer token from four environment variables, read once at startup — the page itself never
+  hardcodes a port or stores the token:
+
+  | Variable | Meaning |
+  | --- | --- |
+  | `ASSISTANT_URL` | The assistant service as reached over the network, e.g. `https://example.ts.net:8443`. |
+  | `ASSISTANT_LOCAL_URL` | Optional — the same service as reached from this machine, e.g. `http://127.0.0.1:5300`, handed out only to a request whose own `Host` is a loopback name. |
+  | `ASSISTANT_TOKEN` | The bearer token the page sends with every request to the assistant. |
+  | `ASSISTANT_VOICE_URL` | Optional — the legacy voice service's WebSocket address; defaults to `ws://127.0.0.1:5281/voice`. |
+
+  Leave `ASSISTANT_URL`, `ASSISTANT_LOCAL_URL` and `ASSISTANT_TOKEN` unset and the panel falls
+  back to the legacy `http://127.0.0.1:5281` service it has always spoken to.
 
 ### Keeping up with upstream
 
@@ -157,6 +170,10 @@ npm install && npm run dev
 ```
 
 Needs Node 22.13 or newer. `npm test` runs the suite.
+
+Contributing a change? Run `git config core.hooksPath .githooks` once, so a commit that would
+leak something private-looking (see `tools/check-private.sh`) is refused before it happens
+rather than after it is pushed.
 
 `npm run dev` is the whole thing: the API lives inside the Vite dev server, so there is no
 second process. For a built version, `npm start` (build + serve) or `npm run serve` if

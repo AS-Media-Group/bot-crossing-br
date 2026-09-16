@@ -24,6 +24,25 @@ const STATE_FILE = path.join(DATA_DIR, 'colony.json')
  */
 const LIMITS_FILE = process.env.BOT_CROSSING_LIMITS || path.join(DATA_DIR, 'limits.json')
 
+/**
+ * The assistant service the Jarvis panel talks to — a separate program, not this one. It is
+ * configured, never hardcoded: `ASSISTANT_URL` is how the page reaches it over the network,
+ * `ASSISTANT_LOCAL_URL` is an optional faster address that only resolves on this machine,
+ * `ASSISTANT_TOKEN` is the bearer token the page sends it, and `ASSISTANT_VOICE_URL` is the
+ * legacy local voice service's WebSocket address. Extracted into a function, rather than read
+ * inline, so a test can hand it a fake environment without touching `process.env` and a dynamic
+ * import; the running server still reads the real environment once, at module load, below.
+ */
+export function assistantConfig(env = process.env) {
+  return {
+    url: env.ASSISTANT_URL || '',
+    localUrl: env.ASSISTANT_LOCAL_URL || '',
+    token: env.ASSISTANT_TOKEN || '',
+    voiceUrl: env.ASSISTANT_VOICE_URL || 'ws://127.0.0.1:5281/voice',
+  }
+}
+const ASSISTANT = assistantConfig()
+
 /** One tally per transcript for the life of the process, so a poll only reads what has been added. */
 const usageCache = new Map()
 
@@ -345,12 +364,13 @@ async function reconcileArchived(threads) {
   return threads.map((t) => (archived(t) ? { ...t, archived: true } : t))
 }
 
-function send(res, status, body) {
+function send(res, status, body, headers = {}) {
   const payload = JSON.stringify(body)
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(payload),
+    ...headers,
   })
   res.end(payload)
 }
@@ -510,6 +530,24 @@ export async function apiMiddleware(req, res, next) {
       const days = Number.isFinite(asked) ? Math.min(MAX_USAGE_DAYS, Math.max(1, Math.trunc(asked))) : DEFAULT_USAGE_DAYS
       const [usage, limits] = await Promise.all([readUsage({ days, cache: usageCache }), readLimits(LIMITS_FILE)])
       return send(res, 200, { ...usage, window: days, limits })
+    }
+
+    /**
+     * Where the Jarvis panel should send its questions, and the token to send with them.
+     *
+     * The token never reaches a page that is not this one, on a host this server does not
+     * answer to — the same gate every other route sits behind. `ASSISTANT_LOCAL_URL` is only
+     * handed back when the caller's own `Host` is a loopback name, on the theory that a page
+     * reached over a network name (a tailnet, say) cannot reach a `127.0.0.1` address that is
+     * local to the *server's* machine, not the browser's.
+     */
+    if (url.pathname === '/api/assistant' && req.method === 'GET') {
+      const { url: networkUrl, localUrl, token, voiceUrl } = ASSISTANT
+      if (!(networkUrl || localUrl) || !token) {
+        return send(res, 200, { url: null, token: null, voiceUrl }, { 'cache-control': 'no-store' })
+      }
+      const useLocal = localUrl && LOOPBACK.has(hostnameOf(req.headers.host))
+      return send(res, 200, { url: useLocal ? localUrl : networkUrl, token, voiceUrl }, { 'cache-control': 'no-store' })
     }
 
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {

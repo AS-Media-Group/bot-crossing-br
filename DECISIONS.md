@@ -75,6 +75,23 @@ Optional `diagnostic()` on an adapter returns a sentence, or `''`. Without it th
 is a harness that reports `detected: true`, throws inside `scanThreads` on every poll, and looks
 perfectly healthy in the HUD while contributing nothing.
 
+## The assistant service is configured, never hardcoded
+
+The Jarvis panel used to speak to exactly one address: `http://127.0.0.1:5281`, baked into
+`src/game/jarvis.js`. That was fine while the assistant only ever ran on the same machine, in
+the same place, with no auth in front of it. None of that holds once the service runs somewhere
+else and needs a bearer token — a constant in client code cannot express "wherever it happens to
+be this week," and a token in client code is a token anyone reading the page's source can read.
+
+So the server hands it out instead. `GET /api/assistant` reads `ASSISTANT_URL`,
+`ASSISTANT_LOCAL_URL`, `ASSISTANT_TOKEN` and `ASSISTANT_VOICE_URL` from the environment once, at
+startup, and answers with the address and token a given request is allowed to have — behind the
+same `isLocalRequest` gate as every other route, so the token only ever reaches this server's own
+page, on a host this server answers to. The page fetches it once, keeps the answer in memory for
+the life of the tab, and never writes it to storage of any kind. Unset the three assistant
+variables and the panel falls back to the old `127.0.0.1:5281` path exactly as before — this
+changes nothing for an install that has not opted in.
+
 ## Pull requests are treated as feature requests
 
 Contributions are read closely and their intent is usually implemented directly, rather than

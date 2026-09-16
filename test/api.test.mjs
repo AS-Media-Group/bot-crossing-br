@@ -115,6 +115,74 @@ test('an allowed name widens nothing else: other hosts, and other origins on it,
   assert.equal((await call(plain, 'GET', '/api/state', { headers: tailnet })).status, 403)
 })
 
+// ── where the Jarvis panel's assistant is, and its token ──────────────────────
+
+/** Like `apiAllowing`, but for any set of environment variables the module reads at import. */
+async function apiWithEnv(overrides) {
+  const keys = Object.keys(overrides)
+  const prev = {}
+  for (const k of keys) {
+    prev[k] = process.env[k]
+    if (overrides[k] === undefined) delete process.env[k]
+    else process.env[k] = overrides[k]
+  }
+  try {
+    return await apiWith(await scratch('data'))
+  } finally {
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k]
+      else process.env[k] = prev[k]
+    }
+  }
+}
+
+test('/api/assistant hands the local address to a loopback Host and the network address to anything else', async () => {
+  const allowedHost = 'assistant-colony.tail5678.ts.net'
+  const api = await apiWithEnv({
+    ASSISTANT_URL: 'https://assistant.example:8443',
+    ASSISTANT_LOCAL_URL: 'http://127.0.0.1:5300',
+    ASSISTANT_TOKEN: 'tok-1',
+    BOT_CROSSING_ALLOWED_HOSTS: allowedHost,
+  })
+
+  const loopback = await call(api, 'GET', '/api/assistant')
+  assert.equal(loopback.status, 200)
+  assert.deepEqual(loopback.json, { url: 'http://127.0.0.1:5300', token: 'tok-1', voiceUrl: 'ws://127.0.0.1:5281/voice' })
+  assert.equal(loopback.headers['cache-control'], 'no-store')
+
+  const network = await call(api, 'GET', '/api/assistant', {
+    headers: { host: allowedHost, origin: `https://${allowedHost}`, 'sec-fetch-site': 'same-origin' },
+  })
+  assert.equal(network.status, 200)
+  assert.deepEqual(network.json, { url: 'https://assistant.example:8443', token: 'tok-1', voiceUrl: 'ws://127.0.0.1:5281/voice' })
+})
+
+test('/api/assistant answers with nulls, plus the legacy voice address, when nothing is configured', async () => {
+  const api = await apiWith(await scratch('data'))
+  const res = await call(api, 'GET', '/api/assistant')
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.json, { url: null, token: null, voiceUrl: 'ws://127.0.0.1:5281/voice' })
+  assert.equal(res.headers['cache-control'], 'no-store')
+})
+
+test('/api/assistant answers with nulls when a URL is set but the token is not', async () => {
+  const api = await apiWithEnv({ ASSISTANT_URL: 'https://assistant.example:8443', ASSISTANT_LOCAL_URL: 'http://127.0.0.1:5300' })
+  const res = await call(api, 'GET', '/api/assistant')
+  assert.deepEqual(res.json, { url: null, token: null, voiceUrl: 'ws://127.0.0.1:5281/voice' })
+})
+
+test('/api/assistant reports a custom ASSISTANT_VOICE_URL even when there is no assistant configured', async () => {
+  const api = await apiWithEnv({ ASSISTANT_VOICE_URL: 'ws://127.0.0.1:9999/voice' })
+  const res = await call(api, 'GET', '/api/assistant')
+  assert.equal(res.json.voiceUrl, 'ws://127.0.0.1:9999/voice')
+})
+
+test('/api/assistant sits behind the same gate as every other route: another page cannot read the token', async () => {
+  const api = await apiWithEnv({ ASSISTANT_URL: 'https://assistant.example:8443', ASSISTANT_TOKEN: 'tok-1' })
+  const res = await call(api, 'GET', '/api/assistant', { headers: { origin: 'http://localhost:3000' } })
+  assert.equal(res.status, 403)
+})
+
 // ── what it will act on ───────────────────────────────────────────────────────
 
 /**

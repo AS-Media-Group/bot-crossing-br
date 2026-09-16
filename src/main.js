@@ -20,7 +20,7 @@ import {
   revealFolder,
 } from './game/api.js'
 import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
-import { askJarvis, jarvisInfo, JARVIS_VOICE_URL } from './game/jarvis.js'
+import { askJarvis, jarvisInfo, loadAssistant, voiceUrl } from './game/jarvis.js'
 import { createVoice, orbFor } from './game/voice.js'
 
 /**
@@ -92,7 +92,7 @@ function closeVoiceTurn() {
 function startVoice() {
   if (voice) return
   voice = createVoice({
-    url: JARVIS_VOICE_URL,
+    url: voiceUrl(),
     onState: (state, reason) => {
       // Listening again means the old question was dropped: a new wake word, or the orb clicked.
       if (state === 'listening') closeVoiceTurn()
@@ -890,7 +890,16 @@ async function boot() {
 
   await poll()
   // Not awaited: the colony's own polling must never wait on a service it does not depend on.
-  checkJarvis()
+  // loadAssistant never throws on its own, but the try/catch keeps a future change to it from
+  // being able to take the colony down with it — this is best-effort, same as checkJarvis below.
+  ;(async () => {
+    try {
+      await loadAssistant()
+    } catch {
+      // Falls back to the legacy Jarvis path, same as loadAssistant's own internal catch.
+    }
+    checkJarvis()
+  })()
   setInterval(poll, POLL_MS)
   window.addEventListener('focus', poll)
   // A tab that was hidden for an hour should catch up the moment it comes back.

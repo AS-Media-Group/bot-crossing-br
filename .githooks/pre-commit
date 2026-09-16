@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installed by `git config core.hooksPath .githooks` (see README). Blocks a commit whose staged
+# diff would leak a private detail into this public repo — see tools/check-private.sh.
+set -eu
+exec ./tools/check-private.sh
