@@ -84,13 +84,49 @@ else and needs a bearer token — a constant in client code cannot express "wher
 be this week," and a token in client code is a token anyone reading the page's source can read.
 
 So the server hands it out instead. `GET /api/assistant` reads `ASSISTANT_URL`,
-`ASSISTANT_LOCAL_URL`, `ASSISTANT_TOKEN` and `ASSISTANT_VOICE_URL` from the environment once, at
-startup, and answers with the address and token a given request is allowed to have — behind the
-same `isLocalRequest` gate as every other route, so the token only ever reaches this server's own
-page, on a host this server answers to. The page fetches it once, keeps the answer in memory for
-the life of the tab, and never writes it to storage of any kind. Unset the three assistant
-variables and the panel falls back to the old `127.0.0.1:5281` path exactly as before — this
-changes nothing for an install that has not opted in.
+`ASSISTANT_LOCAL_URL`, `ASSISTANT_TOKEN`, `ASSISTANT_VOICE_URL` and `ASSISTANT_LOCAL_VOICE_URL`
+from the environment once, at startup, and answers with the address and token a given request is
+allowed to have — behind the same `isLocalRequest` gate as every other route, so the token only
+ever reaches this server's own page, on a host this server answers to. The page fetches it once,
+keeps the answer in memory for the life of the tab, and never writes it to storage of any kind.
+Unset the three assistant variables and the panel falls back to the old `127.0.0.1:5281` path
+exactly as before — this changes nothing for an install that has not opted in.
+
+## The voice address has a local/network split too, mirroring the assistant's own
+
+`ASSISTANT_VOICE_URL` used to be one address for every caller, which breaks the moment the page
+is reachable both on the machine it runs on and over a network name (a tailnet, say): a plain
+loopback `ws://127.0.0.1:…` socket is exactly right for the first case and useless for the
+second — unreachable from elsewhere, and blocked outright as mixed content on an `https://` page.
+
+`ASSISTANT_LOCAL_URL` already solved this for the HTTP address, so the voice address gets the
+same treatment rather than a different shape: `ASSISTANT_LOCAL_VOICE_URL`, handed back only to a
+request whose own `Host` is a loopback name, with `ASSISTANT_VOICE_URL` as the fallback for
+everyone else — including a loopback caller when `ASSISTANT_LOCAL_VOICE_URL` is unset, so an
+install that has not opted in sees byte-identical behaviour.
+
+## The voice socket's first frame carries the token, when there is one
+
+The legacy voice service only ever checked the page's Origin — the WebSocket's very first frame
+has always been a bare `{"type":"hello","v":1}`, with nothing to prove who sent it. That was fine
+while the mic could only ever reach a service on the same machine. It stops being fine the moment
+the assistant is the configured, reachable-from-elsewhere one `ASSISTANT_URL` already points at:
+an Origin check is not an auth check, and a socket cannot send an `Authorization` header the way
+an HTTP request can.
+
+So the first frame carries the same bearer token `ASSISTANT_TOKEN` already hands the panel over
+HTTP, when one is configured: `{"type":"hello","v":1,"token":"…"}`. The token is read from the
+live assistant config at the moment of *connecting* — not once when the page loaded — so a token
+issued or rotated after boot is honoured on the very next reconnect, with no reload needed. With
+no assistant configured the frame is exactly what it always was, byte for byte, and the legacy
+service — which never looks for a `token` field — keeps working unchanged.
+
+A close with WebSocket code `4401` means the token was rejected. The panel does not treat this
+like an ordinary drop: retrying the same rejected token every `backoffMs` tier would just get
+rejected again, forever, for no benefit. It goes to the existing "voice unavailable" state instead
+and stays there — the same restraint already used for `4001` ("another window has the mic") — and
+only tries again once the person clicks the orb, exactly as `4001` already waits for that click
+before taking the mic back.
 
 ## Pull requests are treated as feature requests
 

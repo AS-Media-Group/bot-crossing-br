@@ -262,3 +262,77 @@ test('a non-2xx from /api/assistant itself also falls back to the legacy path', 
     resetAssistantForTests()
   }
 })
+
+// ── voice health: two ways a configured assistant may report readiness ─────────────────
+
+test('voice readiness accepts the legacy string and the object shape alike', async () => {
+  await withAssistant(
+    { url: 'https://assistant.example:8443', token: 'tok-1', voiceUrl: 'wss://voice.example:9443/voice' },
+    async () => {
+      const legacyString = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'https://voice.example:9443/health') return { ok: true, json: async () => ({ voice: 'ready' }) }
+        throw new Error(`unexpected fetch: ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(legacyString, { ok: true, voice: true })
+
+      const objectShape = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'https://voice.example:9443/health') return { ok: true, json: async () => ({ voice: { installed: true, model: 'kokoro' } }) }
+        throw new Error(`unexpected fetch: ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(objectShape, { ok: true, voice: true })
+    },
+  )
+})
+
+test('voice readiness is false for an object that says installed: false, or any other shape', async () => {
+  await withAssistant(
+    { url: 'https://assistant.example:8443', token: 'tok-1', voiceUrl: 'wss://voice.example:9443/voice' },
+    async () => {
+      const notInstalled = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'https://voice.example:9443/health') return { ok: true, json: async () => ({ voice: { installed: false } }) }
+        throw new Error(`unexpected fetch: ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(notInstalled, { ok: true, voice: false })
+
+      const missing = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'https://voice.example:9443/health') return { ok: true, json: async () => ({}) }
+        throw new Error(`unexpected fetch: ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(missing, { ok: true, voice: false })
+    },
+  )
+})
+
+// ── deriving the voice health URL from the voice WS URL ─────────────────────────────────
+
+test('the voice health check lives at the origin\'s /health, not relative to a prefixed voice path', async () => {
+  await withAssistant(
+    { url: 'https://assistant.example:8443', token: 'tok-1', voiceUrl: 'wss://host:8443/v1/voice' },
+    async () => {
+      const info = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'https://host:8443/health') return { ok: true, json: async () => ({ voice: 'ready' }) }
+        throw new Error(`unexpected fetch (health must be at the origin, not /v1/health): ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(info, { ok: true, voice: true })
+    },
+  )
+})
+
+test('a plain ws:// voice path with no prefix still derives to http://host:port/health', async () => {
+  await withAssistant(
+    { url: 'https://assistant.example:8443', token: 'tok-1', voiceUrl: 'ws://host:5281/voice' },
+    async () => {
+      const info = await withFetch(async (url) => {
+        if (String(url) === 'https://assistant.example:8443/health') return { ok: true, json: async () => ({ ok: true }) }
+        if (String(url) === 'http://host:5281/health') return { ok: true, json: async () => ({ voice: 'ready' }) }
+        throw new Error(`unexpected fetch: ${url}`)
+      }, jarvisInfo)
+      assert.deepEqual(info, { ok: true, voice: true })
+    },
+  )
+})

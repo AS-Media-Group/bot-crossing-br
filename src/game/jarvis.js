@@ -52,9 +52,23 @@ export function resetAssistantForTests() {
   cached = { url: null, token: null, voiceUrl: JARVIS_VOICE_URL }
 }
 
-/** `ws://host:port/voice` (or `wss://…`) to the matching `http(s)://host:port/health`. */
+/**
+ * `ws://host:port[/any/path]` (or `wss://…`) to that origin's `http(s)://host:port/health`.
+ * Health always lives at the origin's `/health` — never relative to the voice path itself, so
+ * `wss://host:8443/v1/voice` becomes `https://host:8443/health`, not `.../v1/health`. Falls back
+ * to the old string-rewrite for anything `URL` cannot parse, rather than throwing.
+ */
 function voiceHealthUrl(voice) {
-  return voice.replace(/^ws/, 'http').replace(/\/voice$/, '/health')
+  try {
+    const u = new URL(voice)
+    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:'
+    u.pathname = '/health'
+    u.search = ''
+    u.hash = ''
+    return u.toString()
+  } catch {
+    return voice.replace(/^ws/, 'http').replace(/\/voice$/, '/health')
+  }
 }
 
 /**
@@ -80,12 +94,20 @@ async function pingOk(url, timeoutMs) {
   }
 }
 
+/**
+ * A configured assistant may report voice readiness either the legacy way — the string
+ * `voice: 'ready'` — or as an object, `voice: { installed: true, ... }`. Both count as ready;
+ * anything else (missing, `false`, `installed: false`) does not.
+ */
 async function pingVoiceReady(url, timeoutMs) {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
     if (!res.ok) return false
     const body = await res.json()
-    return body?.voice === 'ready'
+    const voice = body?.voice
+    if (voice === 'ready') return true
+    if (voice && typeof voice === 'object') return voice.installed === true
+    return false
   } catch {
     return false
   }

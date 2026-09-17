@@ -2,6 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { createVoice } from '../src/game/voice.js'
+import { loadAssistant, resetAssistantForTests } from '../src/game/jarvis.js'
+
+/** Sets the cached assistant config `createVoice` reads via `assistant()`, and resets it after. */
+const withAssistant = async (config, fn) => {
+  await loadAssistant(async () => ({ ok: true, json: async () => config }))
+  try {
+    return await fn()
+  } finally {
+    resetAssistantForTests()
+  }
+}
 
 /**
  * createVoice's browser glue (WebSocket, AudioContext, AudioWorklet, getUserMedia) has no real
@@ -472,6 +483,118 @@ test('clicking the orb while voice is unavailable reconnects, for a fresh start 
 
     await tick(600) // the close lands, then the first reconnect backoff (500 ms)
     assert.equal(fakes.sockets.length, 2, 'a new connection was opened')
+  } finally {
+    fakes.restore()
+  }
+})
+
+// ── the hello frame: a bearer token for a configured assistant, legacy otherwise ────────
+
+test('with no assistant configured, the hello frame is exactly the legacy one, byte for byte', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const voice = createVoice({ url: 'ws://fake/voice', onState: () => {} })
+    voice.start()
+    const sock = fakes.sockets[0]
+    await sock.onopen()
+
+    assert.equal(sock.sent[0], '{"type":"hello","v":1}')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('with an assistant token configured, the hello frame carries it', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-secret', voiceUrl: 'ws://fake/voice' }, async () => {
+      const voice = createVoice({ url: 'ws://fake/voice', onState: () => {} })
+      voice.start()
+      const sock = fakes.sockets[0]
+      await sock.onopen()
+
+      assert.deepEqual(JSON.parse(sock.sent[0]), { type: 'hello', v: 1, token: 'tok-secret' })
+    })
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('the token is read fresh at connect time, so a reload between reconnects is honoured', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const voice = createVoice({ url: 'ws://fake/voice', onState: () => {} })
+    voice.start()
+    const sock1 = fakes.sockets[0]
+    await sock1.onopen()
+    assert.deepEqual(JSON.parse(sock1.sent[0]), { type: 'hello', v: 1 }, 'no token yet: legacy frame')
+
+    // The assistant config is (re)loaded with a token in between — createVoice was handed its `url`
+    // once at startup, but the token must still come from the live config on the *next* connect.
+    await loadAssistant(async () => ({ ok: true, json: async () => ({ url: 'https://assistant.example:8443', token: 'fresh-tok', voiceUrl: 'ws://fake/voice' }) }))
+    try {
+      sock1.onclose({ code: 4001 }) // taken: orbClicked's reconnect is the simplest way to force a fresh connect()
+      await voice.orbClicked()
+      const sock2 = fakes.sockets[1]
+      await sock2.onopen()
+      assert.deepEqual(JSON.parse(sock2.sent[0]), { type: 'hello', v: 1, token: 'fresh-tok' })
+    } finally {
+      resetAssistantForTests()
+    }
+  } finally {
+    fakes.restore()
+  }
+})
+
+// ── a 4401 close: unauthorized, never hammered, only retried on a click ─────────────────
+
+test('a 4401 close goes to "unavailable" (not "taken"), and does not schedule its own reconnect', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const states = []
+    const voice = createVoice({ url: 'ws://fake/voice', onState: (s, r) => states.push([s, r]) })
+    voice.start()
+    const sock1 = fakes.sockets[0]
+
+    sock1.onclose({ code: 4401 })
+    assert.deepEqual(states.at(-1), ['unavailable', 'unauthorized'])
+
+    await tick(6000) // well past every backoff tier; nothing should have reconnected on its own
+    assert.equal(fakes.sockets.length, 1, 'a 4401 must not be hammered with automatic reconnects')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a 4401 close survives a mute toggle with no socket, same as "taken" does', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const states = []
+    const voice = createVoice({ url: 'ws://fake/voice', onState: (s, r) => states.push([s, r]) })
+    voice.start()
+    fakes.sockets[0].onclose({ code: 4401 })
+
+    voice.toggleMute() // there is no socket at all right now
+    assert.deepEqual(states.at(-1), ['unavailable', 'unauthorized'], 'muting with no socket must not paper over it')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('clicking the orb after a 4401 reconnects \u2014 the only way voice retries after unauthorized', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const states = []
+    const voice = createVoice({ url: 'ws://fake/voice', onState: (s, r) => states.push([s, r]) })
+    voice.start()
+    const sock1 = fakes.sockets[0]
+    sock1.onclose({ code: 4401 })
+    assert.equal(fakes.sockets.length, 1)
+
+    await voice.orbClicked()
+    assert.equal(fakes.sockets.length, 2, 'orbClicked opened a fresh connection')
+    assert.notEqual(fakes.sockets[1], sock1)
+    assert.deepEqual(states.at(-1), ['disconnected', undefined], 'the state moved on from unauthorized')
   } finally {
     fakes.restore()
   }

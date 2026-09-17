@@ -177,6 +177,47 @@ test('/api/assistant reports a custom ASSISTANT_VOICE_URL even when there is no 
   assert.equal(res.json.voiceUrl, 'ws://127.0.0.1:9999/voice')
 })
 
+test('/api/assistant hands the local voice address to a loopback Host and the network voice address to anything else', async () => {
+  const allowedHost = 'assistant-colony.tail5678.ts.net'
+  const api = await apiWithEnv({
+    ASSISTANT_URL: 'https://assistant.example:8443',
+    ASSISTANT_TOKEN: 'tok-1',
+    ASSISTANT_VOICE_URL: 'wss://assistant.example:8443/voice',
+    ASSISTANT_LOCAL_VOICE_URL: 'ws://127.0.0.1:5300/voice',
+    BOT_CROSSING_ALLOWED_HOSTS: allowedHost,
+  })
+
+  const loopback = await call(api, 'GET', '/api/assistant')
+  assert.equal(loopback.json.voiceUrl, 'ws://127.0.0.1:5300/voice')
+
+  const network = await call(api, 'GET', '/api/assistant', {
+    headers: { host: allowedHost, origin: `https://${allowedHost}`, 'sec-fetch-site': 'same-origin' },
+  })
+  assert.equal(network.json.voiceUrl, 'wss://assistant.example:8443/voice')
+})
+
+test('with ASSISTANT_LOCAL_VOICE_URL unset, both a loopback Host and a network one fall back to ASSISTANT_VOICE_URL', async () => {
+  const allowedHost = 'assistant-colony.tail5678.ts.net'
+  const api = await apiWithEnv({
+    ASSISTANT_VOICE_URL: 'wss://assistant.example:8443/voice',
+    BOT_CROSSING_ALLOWED_HOSTS: allowedHost,
+  })
+
+  const loopback = await call(api, 'GET', '/api/assistant')
+  assert.equal(loopback.json.voiceUrl, 'wss://assistant.example:8443/voice')
+
+  const network = await call(api, 'GET', '/api/assistant', {
+    headers: { host: allowedHost, origin: `https://${allowedHost}`, 'sec-fetch-site': 'same-origin' },
+  })
+  assert.equal(network.json.voiceUrl, 'wss://assistant.example:8443/voice')
+})
+
+test('with nothing configured at all, a loopback Host still gets the legacy default voice address unchanged', async () => {
+  const api = await apiWith(await scratch('data'))
+  const res = await call(api, 'GET', '/api/assistant')
+  assert.equal(res.json.voiceUrl, 'ws://127.0.0.1:5281/voice')
+})
+
 test('/api/assistant sits behind the same gate as every other route: another page cannot read the token', async () => {
   const api = await apiWithEnv({ ASSISTANT_URL: 'https://assistant.example:8443', ASSISTANT_TOKEN: 'tok-1' })
   const res = await call(api, 'GET', '/api/assistant', { headers: { origin: 'http://localhost:3000' } })

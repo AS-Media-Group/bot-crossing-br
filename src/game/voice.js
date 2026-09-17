@@ -7,6 +7,8 @@
  *
  * The pure helpers at the top are what the tests cover; createVoice below them is browser glue.
  */
+import { assistant } from './jarvis.js'
+
 export const MIC_RATE = 16000
 const MUTE_KEY = 'bc.jarvis.muted'
 const ACTIVE = new Set(['listening', 'thinking', 'speaking', 'followup'])
@@ -100,6 +102,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   let server = { state: 'disconnected' } // the last state Jarvis sent (or the connection's own)
   let overlay = null // a local problem Jarvis cannot see: 'needs-click' or 'blocked'
   let taken = false // set only by a 4001 close; kept apart from `server` so muting never masks it
+  let unauthorized = false // set only by a 4401 close; same idea as `taken` — never auto-retried
   let state = 'disconnected'
   let incoming = null // { id, rate }: the say whose audio is arriving
   let sources = []
@@ -107,10 +110,20 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   let playedTimers = []
 
   // `taken` wins over everything else — a window that lost the mic stays visibly "taken" no matter
-  // what Jarvis or a local mute does next, until orbClicked asks to reconnect.
+  // what Jarvis or a local mute does next, until orbClicked asks to reconnect. `unauthorized` is the
+  // same idea for a 4401 close: shown as the existing 'unavailable' state (the UI already knows how
+  // to render it, even for a reason it has no specific label for) until orbClicked asks to retry.
   const show = () => {
-    state = taken ? 'taken' : overlay ?? server.state
-    onState(state, taken || overlay ? undefined : server.reason)
+    if (taken) {
+      state = 'taken'
+      return onState(state, undefined)
+    }
+    if (unauthorized) {
+      state = 'unavailable'
+      return onState(state, 'unauthorized')
+    }
+    state = overlay ?? server.state
+    onState(state, overlay ? undefined : server.reason)
   }
   const setServer = (s, reason) => {
     server = { state: s, reason }
@@ -357,13 +370,19 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
 
   function connect() {
     clearTimeout(retry)
+    // Read fresh on every connect — not once at module load — so an assistant config reloaded
+    // between reconnects (a new token, or a legacy service with none) is honoured immediately.
+    const { token } = assistant()
     const sock = new WebSocket(url) // bound to its own handlers below, so a stale socket can never touch `ws`
     ws = sock
     sock.binaryType = 'arraybuffer'
     sock.onopen = async () => {
       if (sock !== ws) return
       attempt = 0
-      send({ type: 'hello', v: 1 })
+      // A configured assistant may require the same bearer token the panel sends over HTTP,
+      // presented in this first frame; with none configured the frame stays exactly what the
+      // legacy Origin-only service has always seen.
+      send(token ? { type: 'hello', v: 1, token } : { type: 'hello', v: 1 })
       if (muted) send({ type: 'mute', on: true })
       onReconnect()
       if (!(await audioReady())) {
@@ -386,6 +405,10 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
       stopPlayback()
       if (e.code === 4001) {
         taken = true // another window has the mic: never grab it back unasked
+        return show()
+      }
+      if (e.code === 4401) {
+        unauthorized = true // the token was rejected: hammering reconnect would just be rejected again
         return show()
       }
       setServer('disconnected')
@@ -428,6 +451,13 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
         taken = false
         setServer('disconnected')
         return connect() // Jarvis hands the mic to the newest window: this one
+      }
+      if (unauthorized) {
+        // ws is already null — the close that set this already tore it down, so unlike the
+        // 'unavailable' branch below, a plain ws?.close() here would be a no-op.
+        unauthorized = false
+        setServer('disconnected')
+        return connect()
       }
       if (overlay) return wakeAudio().catch(() => {})
       // Jarvis gave up on its voice for this connection; a fresh one starts it again. The socket's

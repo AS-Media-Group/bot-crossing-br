@@ -28,10 +28,15 @@ const LIMITS_FILE = process.env.BOT_CROSSING_LIMITS || path.join(DATA_DIR, 'limi
  * The assistant service the Jarvis panel talks to — a separate program, not this one. It is
  * configured, never hardcoded: `ASSISTANT_URL` is how the page reaches it over the network,
  * `ASSISTANT_LOCAL_URL` is an optional faster address that only resolves on this machine,
- * `ASSISTANT_TOKEN` is the bearer token the page sends it, and `ASSISTANT_VOICE_URL` is the
- * legacy local voice service's WebSocket address. Extracted into a function, rather than read
- * inline, so a test can hand it a fake environment without touching `process.env` and a dynamic
- * import; the running server still reads the real environment once, at module load, below.
+ * `ASSISTANT_TOKEN` is the bearer token the page sends it, `ASSISTANT_VOICE_URL` is the voice
+ * service's WebSocket address, and `ASSISTANT_LOCAL_VOICE_URL` is that same voice address's
+ * loopback-only counterpart, exactly as `ASSISTANT_LOCAL_URL` is to `ASSISTANT_URL` — a page
+ * opened on this machine can use a plain `ws://127.0.0.1:…` voice socket, while a page reached
+ * over a network name needs a `wss://` address, because `ws://127.0.0.1` is both unreachable
+ * from elsewhere and blocked as mixed content on an `https://` page. Extracted into a function,
+ * rather than read inline, so a test can hand it a fake environment without touching
+ * `process.env` and a dynamic import; the running server still reads the real environment once,
+ * at module load, below.
  */
 export function assistantConfig(env = process.env) {
   return {
@@ -39,6 +44,7 @@ export function assistantConfig(env = process.env) {
     localUrl: env.ASSISTANT_LOCAL_URL || '',
     token: env.ASSISTANT_TOKEN || '',
     voiceUrl: env.ASSISTANT_VOICE_URL || 'ws://127.0.0.1:5281/voice',
+    localVoiceUrl: env.ASSISTANT_LOCAL_VOICE_URL || '',
   }
 }
 const ASSISTANT = assistantConfig()
@@ -539,15 +545,21 @@ export async function apiMiddleware(req, res, next) {
      * answer to — the same gate every other route sits behind. `ASSISTANT_LOCAL_URL` is only
      * handed back when the caller's own `Host` is a loopback name, on the theory that a page
      * reached over a network name (a tailnet, say) cannot reach a `127.0.0.1` address that is
-     * local to the *server's* machine, not the browser's.
+     * local to the *server's* machine, not the browser's. `ASSISTANT_LOCAL_VOICE_URL` gets the
+     * same treatment, and for the same reason: a page opened on this machine can use a plain
+     * loopback `ws://` voice socket, but a page reached over a network name needs the `wss://`
+     * address in `ASSISTANT_VOICE_URL` instead — a `ws://127.0.0.1` socket is unreachable from
+     * elsewhere, and blocked outright as mixed content on an `https://` page.
      */
     if (url.pathname === '/api/assistant' && req.method === 'GET') {
-      const { url: networkUrl, localUrl, token, voiceUrl } = ASSISTANT
+      const { url: networkUrl, localUrl, token, voiceUrl, localVoiceUrl } = ASSISTANT
+      const isLocal = LOOPBACK.has(hostnameOf(req.headers.host))
+      const chosenVoiceUrl = (isLocal && localVoiceUrl) || voiceUrl
       if (!(networkUrl || localUrl) || !token) {
-        return send(res, 200, { url: null, token: null, voiceUrl }, { 'cache-control': 'no-store' })
+        return send(res, 200, { url: null, token: null, voiceUrl: chosenVoiceUrl }, { 'cache-control': 'no-store' })
       }
-      const useLocal = localUrl && LOOPBACK.has(hostnameOf(req.headers.host))
-      return send(res, 200, { url: useLocal ? localUrl : networkUrl, token, voiceUrl }, { 'cache-control': 'no-store' })
+      const useLocal = localUrl && isLocal
+      return send(res, 200, { url: useLocal ? localUrl : networkUrl, token, voiceUrl: chosenVoiceUrl }, { 'cache-control': 'no-store' })
     }
 
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {

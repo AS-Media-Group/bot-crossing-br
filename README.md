@@ -141,7 +141,7 @@ Design notes and plans for the larger changes are in
   panel. The microphone only goes to that service while a colony window is open; `M` mutes it
   (Chrome's mic light goes out) and `Esc` stops it talking. Only one window listens at a time.
 - **Where it is set up.** The colony's own server hands the page the assistant's address and
-  bearer token from four environment variables, read once at startup — the page itself never
+  bearer token from six environment variables, read once at startup — the page itself never
   hardcodes a port or stores the token:
 
   | Variable | Meaning |
@@ -149,10 +149,26 @@ Design notes and plans for the larger changes are in
   | `ASSISTANT_URL` | The assistant service as reached over the network, e.g. `https://example.ts.net:8443`. |
   | `ASSISTANT_LOCAL_URL` | Optional — the same service as reached from this machine, e.g. `http://127.0.0.1:5300`, handed out only to a request whose own `Host` is a loopback name. |
   | `ASSISTANT_TOKEN` | The bearer token the page sends with every request to the assistant. |
-  | `ASSISTANT_VOICE_URL` | Optional — the legacy voice service's WebSocket address; defaults to `ws://127.0.0.1:5281/voice`. |
+  | `ASSISTANT_VOICE_URL` | Optional — the voice service's WebSocket address; defaults to `ws://127.0.0.1:5281/voice`. |
+  | `ASSISTANT_LOCAL_VOICE_URL` | Optional — the same voice service as reached from this machine, e.g. `ws://127.0.0.1:5300/voice`, handed out only to a request whose own `Host` is a loopback name, exactly as `ASSISTANT_LOCAL_URL` is to `ASSISTANT_URL`. |
 
   Leave `ASSISTANT_URL`, `ASSISTANT_LOCAL_URL` and `ASSISTANT_TOKEN` unset and the panel falls
-  back to the legacy `http://127.0.0.1:5281` service it has always spoken to.
+  back to the legacy `http://127.0.0.1:5281` service it has always spoken to. Leave
+  `ASSISTANT_LOCAL_VOICE_URL` unset and every caller gets `ASSISTANT_VOICE_URL`, exactly as
+  before — it only matters once the page can be opened both on this machine and over a network
+  name, where a loopback `ws://` address would be unreachable, or blocked as mixed content, from
+  the network side.
+
+- **The voice socket can require the same token, too.** The legacy voice service only ever
+  checked the page's Origin, so the first frame the browser sends it has always been a bare
+  `{"type":"hello","v":1}`. A configured assistant may instead require the bearer token
+  `ASSISTANT_TOKEN` already sends over HTTP, presented in that same first frame —
+  `{"type":"hello","v":1,"token":"…"}` — read fresh from the live config on every connect, so
+  a token issued or rotated after boot is honoured on the next reconnect without a reload. With
+  no token configured the frame is byte-for-byte what it always was. If the assistant closes the
+  socket with WebSocket close code `4401` (unauthorized), the panel does not hammer it with
+  reconnects — it shows voice as unavailable and waits for a click on the orb before trying
+  again, the same restraint it already uses when another window has taken the microphone.
 
 ### Keeping up with upstream
 
