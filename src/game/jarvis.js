@@ -173,11 +173,16 @@ async function readNdjson(res, onLine) {
 }
 
 /**
- * Asks the assistant a question. Accepts an optional `{ onDelta }` — the panel does not stream
- * yet, but a comment here is the seam for when it does: `onDelta(text)` fires for every `delta`
- * line, in order, as they arrive.
+ * Asks the assistant a question. Accepts an optional `{ onDelta, onConfirm }` — the panel does
+ * not stream deltas yet, but a comment here is the seam for when it does: `onDelta(text)` fires
+ * for every `delta` line, in order, as they arrive. `onConfirm(line)` fires for every `confirm`
+ * line — `{type:'confirm', request_id, summary, risk, expires_at}` — the moment the assistant
+ * puts a card up, which is *before* the final reply (whose own `action` may also read `'confirm'`
+ * once it lands, since a turn that opened a card answers with nothing else to say yet). That line
+ * never carries a `nonce` — only `GET /v1/confirm` does — so `onConfirm` is a signal to go fetch
+ * the pending list, not something to build a card from directly.
  */
-async function askAssistant(question, { onDelta } = {}) {
+async function askAssistant(question, { onDelta, onConfirm } = {}) {
   const { url, token } = cached
   let reply = null
   let errorText = null
@@ -198,6 +203,7 @@ async function askAssistant(question, { onDelta } = {}) {
     }
     await readNdjson(res, (line) => {
       if (line.type === 'delta') onDelta?.(line.text)
+      else if (line.type === 'confirm') onConfirm?.(line)
       else if (line.type === 'error') errorText = line.text
       else if (line.type === 'reply') reply = line.reply
     })
@@ -223,4 +229,99 @@ export async function askJarvis(question, opts) {
   } catch {
     return { text: "I can't reach Jarvis — it does not seem to be running.", detail: '', sources: [], lane: 'error', ms: 0 }
   }
+}
+
+// ── confirmation cards ──────────────────────────────────────────────────────────────────
+//
+// A risky action (trash a file, delete it for good) waits behind a card the panel renders, and
+// the person answers with a click — never a spoken word, and never by re-asking the assistant.
+// Both functions here only ever talk to the *configured assistant*, never the legacy `:5281`
+// service: the confirm routes are new to it, and there is nothing to fall back to. Neither
+// function ever throws — a card that cannot be fetched or answered is exactly as safe as one that
+// was never opened, so the caller always gets a value back to show, not an exception to catch.
+
+const CONFIRM_UNREACHABLE = "I can't reach the assistant \u2014 it does not seem to be running."
+
+/** A plain sentence for a status the server did not send its own `reply.text` alongside. */
+const CONFIRM_STATUS_TEXT = {
+  confirmed: 'Done.',
+  declined: 'Okay, cancelled.',
+  expired: "That one's expired, so I've left it alone.",
+  unknown: "I couldn't find that request anymore.",
+  refused: "That wasn't allowed.",
+}
+
+/**
+ * The richer form behind `pendingConfirmations()`. Same fetch, same never-throws contract, but it
+ * keeps "the request itself failed" (`ok: false`) apart from "it succeeded, and there is
+ * genuinely nothing pending" (`ok: true, requests: []`) — a distinction `pendingConfirmations()`
+ * collapses on purpose, because most callers only ever want the list. The confirm-card glue
+ * (`confirm-panel.js`) is the one caller that needs to tell them apart: a `confirm` signal from
+ * the assistant promised a card, so if this comes back `ok: false` it has something to say about
+ * *why* the card is not showing, and if it comes back `ok: true` with nothing in it, it does not.
+ */
+export async function pendingConfirmationsDetailed({ fetchImpl = fetch, timeoutMs = 4000 } = {}) {
+  const { url, token } = cached
+  if (!url) return { ok: false, requests: [] }
+  try {
+    const res = await fetchImpl(`${url}/v1/confirm`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) return { ok: false, requests: [] }
+    const body = await res.json()
+    const requests = Array.isArray(body?.requests) ? body.requests : null
+    if (requests === null) return { ok: false, requests: [] }
+    return { ok: true, requests }
+  } catch {
+    return { ok: false, requests: [] }
+  }
+}
+
+/**
+ * The assistant's open confirmation cards, or `[]` on any failure at all — nothing configured, a
+ * non-200, a body that is not the JSON it expects, or a timeout. `[]` is exactly what an empty
+ * pending list looks like, which is the right thing for a panel to show either way: nothing to
+ * confirm right now. A thin wrapper over `pendingConfirmationsDetailed`, for callers that only
+ * ever want the list.
+ */
+export async function pendingConfirmations(opts) {
+  return (await pendingConfirmationsDetailed(opts)).requests
+}
+
+/**
+ * Answers one card. `decision` is `'yes'` or `'no'`; `how` is always `'click'` — a card is the
+ * only way 3A confirms anything, so this file never sends anything else. The gateway can answer
+ * with a non-2xx status (404 unknown, 410 expired, 403 refused) whose *body* still carries the
+ * real `status`, so that body is always read, never just the HTTP status code.
+ *
+ * Returns `{status, text}`: `text` is the server's own `reply.text` when it sent one (the outcome
+ * of whatever the card asked to do), otherwise a plain sentence for the status. A request that
+ * never reached the assistant at all — no `url` configured, the network failed, the body was not
+ * JSON — reads as `status: 'unreachable'` (this file's own name for it; the gateway never sends
+ * it), with the same "can't reach it" sentence `askJarvis` uses elsewhere in this file.
+ */
+export async function answerConfirmation({ request_id, nonce, decision }, { fetchImpl = fetch, timeoutMs = 4000 } = {}) {
+  const { url, token } = cached
+  if (!url) return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
+  let res
+  try {
+    res = await fetchImpl(`${url}/v1/confirm`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'confirm.answer', request_id, nonce, decision, how: 'click' }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch {
+    return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
+  }
+  let body
+  try {
+    body = await res.json()
+  } catch {
+    return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
+  }
+  const status = body?.status || 'unknown'
+  const text = body?.reply?.text || CONFIRM_STATUS_TEXT[status] || CONFIRM_UNREACHABLE
+  return { status, text }
 }

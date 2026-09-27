@@ -2,11 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  answerConfirmation,
   askJarvis,
   assistant,
   jarvisHealth,
   jarvisInfo,
   loadAssistant,
+  pendingConfirmations,
+  pendingConfirmationsDetailed,
   resetAssistantForTests,
   voiceUrl,
 } from '../src/game/jarvis.js'
@@ -335,4 +338,215 @@ test('a plain ws:// voice path with no prefix still derives to http://host:port/
       assert.deepEqual(info, { ok: true, voice: true })
     },
   )
+})
+
+// ── askAssistant surfaces a confirm card ─────────────────────────────────────────────────
+
+test('a confirm line in the NDJSON stream reaches the caller\u2019s onConfirm, and the reply keeps action:\u2018confirm\u2019', async () => {
+  const lines = [
+    '{"type":"ack","text":"on it"}',
+    '{"type":"confirm","request_id":"c_1","summary":"Trash the old export?","risk":"delete","expires_at":1700000060000}',
+    '{"type":"reply","reply":{"text":"I\'ve put a card up: Trash the old export?.","detail":"","sources":[],"action":"confirm","lane":"fast","ms":5,"model":null,"session_id":"s1"}}',
+  ]
+  const confirms = []
+  const reply = await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, () =>
+    withFetch(async () => ndjsonResponse(lines, 5), () => askJarvis('trash the export', { onConfirm: (line) => confirms.push(line) })),
+  )
+  assert.deepEqual(confirms, [{ type: 'confirm', request_id: 'c_1', summary: 'Trash the old export?', risk: 'delete', expires_at: 1700000060000 }])
+  assert.equal(reply.action, 'confirm')
+  assert.equal(reply.text, 'I\'ve put a card up: Trash the old export?.')
+})
+
+test('askJarvis with no onConfirm still returns the reply fine \u2014 a caller that does not care about cards is not broken by them', async () => {
+  const lines = [
+    '{"type":"confirm","request_id":"c_1","summary":"Trash it?","risk":"delete","expires_at":1}',
+    '{"type":"reply","reply":{"text":"done","detail":"","sources":[],"action":null,"lane":"fast","ms":1,"model":null,"session_id":"s1"}}',
+  ]
+  const reply = await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, () =>
+    withFetch(async () => ndjsonResponse(lines, 3), () => askJarvis('hello')),
+  )
+  assert.equal(reply.text, 'done')
+})
+
+// ── pendingConfirmations ─────────────────────────────────────────────────────────────────
+
+test('with no assistant configured, pendingConfirmations reads as no cards \u2014 without even trying to fetch', async () => {
+  await resetAssistantForTests()
+  let called = false
+  const requests = await pendingConfirmations({ fetchImpl: async () => { called = true; return { ok: true, json: async () => ({ requests: [] }) } } })
+  assert.deepEqual(requests, [])
+  assert.equal(called, false)
+})
+
+test('pendingConfirmations asks GET /v1/confirm with the assistant\u2019s bearer token, and hands back its requests', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const req = { request_id: 'c_1', nonce: 'n1', action: { tool: 'files.trash', summary: 'Trash the old export?', risk: 'delete' }, expires_at: 1700000060000 }
+    const requests = await pendingConfirmations({
+      fetchImpl: async (url, opts) => {
+        assert.equal(String(url), 'https://assistant.example:8443/v1/confirm')
+        assert.equal(opts.method, undefined) // GET, no method override
+        assert.equal(opts.headers.authorization, 'Bearer tok-1')
+        return { ok: true, json: async () => ({ requests: [req] }) }
+      },
+    })
+    assert.deepEqual(requests, [req])
+  })
+})
+
+test('a non-200, a body with no requests array, a bad JSON body, or a thrown network error all read as no cards', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => ({ ok: false, status: 500, json: async () => ({ requests: [{ request_id: 'x' }] }) }) }), [])
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => ({ ok: true, json: async () => ({}) }) }), [])
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }) }), [])
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => { throw new Error('ECONNREFUSED') } }), [])
+  })
+})
+
+test('pendingConfirmations gives up on its own deadline rather than hanging on a port that never answers', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const hanging = (url, opts = {}) =>
+      new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve({ ok: true, json: async () => ({ requests: [] }) }), 3000)
+        opts.signal?.addEventListener('abort', () => {
+          clearTimeout(t)
+          reject(opts.signal.reason)
+        })
+      })
+    const started = Date.now()
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: hanging, timeoutMs: 50 }), [])
+    assert.ok(Date.now() - started < 1000, 'it gives up on its own deadline, not the server\'s')
+  })
+})
+
+// ── pendingConfirmationsDetailed: the richer form confirm-panel.js needs (ruling 7) ─────────
+
+test('pendingConfirmationsDetailed tells a real empty list apart from a failed fetch \u2014 pendingConfirmations still collapses both to []', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const req = { request_id: 'c_1', nonce: 'n1', action: { tool: 'files.trash', summary: 'Trash it?', risk: 'delete' }, expires_at: 1 }
+
+    const genuinelyEmpty = await pendingConfirmationsDetailed({ fetchImpl: async () => ({ ok: true, json: async () => ({ requests: [] }) }) })
+    assert.deepEqual(genuinelyEmpty, { ok: true, requests: [] })
+
+    const withOne = await pendingConfirmationsDetailed({ fetchImpl: async () => ({ ok: true, json: async () => ({ requests: [req] }) }) })
+    assert.deepEqual(withOne, { ok: true, requests: [req] })
+
+    const httpFailure = await pendingConfirmationsDetailed({ fetchImpl: async () => ({ ok: false, status: 500, json: async () => ({ requests: [req] }) }) })
+    assert.deepEqual(httpFailure, { ok: false, requests: [] })
+
+    const malformedBody = await pendingConfirmationsDetailed({ fetchImpl: async () => ({ ok: true, json: async () => ({}) }) })
+    assert.deepEqual(malformedBody, { ok: false, requests: [] })
+
+    const badJson = await pendingConfirmationsDetailed({ fetchImpl: async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }) })
+    assert.deepEqual(badJson, { ok: false, requests: [] })
+
+    const networkFailure = await pendingConfirmationsDetailed({ fetchImpl: async () => { throw new Error('ECONNREFUSED') } })
+    assert.deepEqual(networkFailure, { ok: false, requests: [] })
+
+    // pendingConfirmations() is a thin wrapper: same [] either way, exactly as it always has been.
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => ({ ok: true, json: async () => ({ requests: [] }) }) }), [])
+    assert.deepEqual(await pendingConfirmations({ fetchImpl: async () => ({ ok: false, status: 500, json: async () => ({}) }) }), [])
+  })
+})
+
+test('with no assistant configured, pendingConfirmationsDetailed reads as a failure too \u2014 without even trying to fetch', async () => {
+  await resetAssistantForTests()
+  let called = false
+  const result = await pendingConfirmationsDetailed({ fetchImpl: async () => { called = true; return { ok: true, json: async () => ({ requests: [] }) } } })
+  assert.deepEqual(result, { ok: false, requests: [] })
+  assert.equal(called, false)
+})
+
+// ── answerConfirmation ────────────────────────────────────────────────────────────────────
+
+test('with no assistant configured, answerConfirmation reports it cannot reach anything \u2014 without trying to fetch', async () => {
+  await resetAssistantForTests()
+  let called = false
+  const result = await answerConfirmation(
+    { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
+    { fetchImpl: async () => { called = true; return { ok: true, json: async () => ({ status: 'confirmed' }) } } },
+  )
+  assert.equal(result.status, 'unreachable')
+  assert.match(result.text, /can't reach the assistant/i)
+  assert.equal(called, false)
+})
+
+test('answerConfirmation POSTs a confirm.answer with how:click, and returns the server\u2019s status and reply text', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const result = await answerConfirmation(
+      { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
+      {
+        fetchImpl: async (url, opts) => {
+          assert.equal(String(url), 'https://assistant.example:8443/v1/confirm')
+          assert.equal(opts.method, 'POST')
+          assert.equal(opts.headers.authorization, 'Bearer tok-1')
+          assert.equal(opts.headers['content-type'], 'application/json')
+          assert.deepEqual(JSON.parse(opts.body), { type: 'confirm.answer', request_id: 'c_1', nonce: 'n1', decision: 'yes', how: 'click' })
+          return { ok: true, json: async () => ({ status: 'confirmed', reply: { text: 'Moved "export.zip" to the Trash.', detail: '', sources: [], action: null } }) }
+        },
+      },
+    )
+    assert.deepEqual(result, { status: 'confirmed', text: 'Moved "export.zip" to the Trash.' })
+  })
+})
+
+test('a status with no reply falls back to a plain sentence for that status', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const answer = (status) =>
+      answerConfirmation({ request_id: 'c_1', nonce: 'n1', decision: 'no' }, { fetchImpl: async () => ({ ok: true, json: async () => ({ status }) }) })
+
+    assert.deepEqual(await answer('declined'), { status: 'declined', text: 'Okay, cancelled.' })
+    assert.equal((await answer('expired')).status, 'expired')
+    assert.equal((await answer('unknown')).status, 'unknown')
+    assert.equal((await answer('refused')).status, 'refused')
+  })
+})
+
+test('a 404/410/403 still carries a real status in its body, and that body is what wins, not the HTTP code', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const answer = (httpStatus, bodyStatus) =>
+      answerConfirmation(
+        { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
+        { fetchImpl: async () => ({ ok: false, status: httpStatus, json: async () => ({ status: bodyStatus }) }) },
+      )
+
+    assert.equal((await answer(404, 'unknown')).status, 'unknown')
+    assert.equal((await answer(410, 'expired')).status, 'expired')
+    assert.equal((await answer(403, 'refused')).status, 'refused')
+  })
+})
+
+test('a network failure or an unparsable body reads as unreachable, not an exception', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const thrown = await answerConfirmation({ request_id: 'c_1', nonce: 'n1', decision: 'yes' }, { fetchImpl: async () => { throw new Error('ECONNREFUSED') } })
+    assert.equal(thrown.status, 'unreachable')
+
+    const badJson = await answerConfirmation(
+      { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
+      { fetchImpl: async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }) },
+    )
+    assert.equal(badJson.status, 'unreachable')
+  })
+})
+
+test('the nonce travels in the POST body and nowhere else \u2014 it is never logged by this function', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const secretNonce = 'SECRET-NONCE-client-test-4d5e6f'
+    const calls = []
+    const spy = (...args) => calls.push(args)
+    const real = { log: console.log, warn: console.warn, error: console.error }
+    console.log = spy
+    console.warn = spy
+    console.error = spy
+    try {
+      await answerConfirmation(
+        { request_id: 'c_1', nonce: secretNonce, decision: 'yes' },
+        { fetchImpl: async (url, opts) => { assert.match(opts.body, new RegExp(secretNonce)); return { ok: true, json: async () => ({ status: 'confirmed', reply: { text: 'Done.' } }) } } },
+      )
+    } finally {
+      console.log = real.log
+      console.warn = real.warn
+      console.error = real.error
+    }
+    assert.equal(calls.length, 0)
+  })
 })

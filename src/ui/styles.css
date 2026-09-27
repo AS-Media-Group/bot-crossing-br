@@ -1679,6 +1679,96 @@ kbd {
   border-color: #6f9ff0;
 }
 
+/* ── Confirmation cards: a risky action waiting for a click, never for a spoken word ─────────── */
+.j-confirms {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.j-confirms:empty {
+  display: none;
+}
+
+.j-confirm {
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.16));
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 12.5px;
+}
+
+.c-summary {
+  line-height: 1.4;
+  margin-bottom: 4px;
+}
+
+.c-risk {
+  display: inline-block;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 600;
+  color: #e2a25a;
+  border: 1px solid rgba(226, 162, 90, 0.4);
+  border-radius: 5px;
+  padding: 1px 5px;
+  margin-bottom: 6px;
+}
+
+.c-countdown {
+  font-size: 10.5px;
+  color: var(--ink-3, #8a8d98);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.c-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.c-actions button {
+  flex: 1;
+}
+
+.c-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.c-outcome {
+  line-height: 1.4;
+}
+
+.c-retry {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: #e2a25a;
+}
+
+.j-confirm-placeholder {
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.16));
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 12.5px;
+  color: var(--ink-3, #8a8d98);
+}
+
+/* Visually hidden but still reachable by a screen reader — for announcements that should not take
+   up any space in the card itself (the 30s/10s countdown warning). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ── Jarvis's voice: one orb, the same look in the panel and as a ring on the bar button ─────── */
 .j-voice {
   display: inline-flex;

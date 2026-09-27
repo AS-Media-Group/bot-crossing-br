@@ -5,6 +5,7 @@ import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
 import { PLOT_PALETTE, hashString } from '../world/plots.js'
 import { formatTokens, limitChip, resetLabel, zoneUsage } from '../game/usage-view.js'
+import { ConfirmPanel } from './confirm-panel.js'
 
 /**
  * The whole HUD, in plain DOM.
@@ -93,6 +94,8 @@ export class Hud {
     this._buildStats()
     this._buildSettings()
     this._buildAvatar()
+    // The confirm-card glue is its own small, testable module — see confirm-panel.js's header.
+    this.confirmPanel = new ConfirmPanel({ container: this.$('.jarvis .j-confirms') })
     this._wire()
     this.syncSettings()
   }
@@ -1037,6 +1040,24 @@ export class Hud {
     log.scrollTop = log.scrollHeight
   }
 
+  // ── confirmation cards ────────────────────────────────────────────────────────────────
+  //
+  // A risky action waits behind a card until it gets a click. All of it — the state machine and
+  // wording (confirm-cards.js) and the DOM glue, timers and nonce handling (confirm-panel.js) —
+  // lives outside this file and is tested there. `hud.js` only owns the container element and the
+  // `jarvisReady` gate; see confirm-panel.js's header for the security invariant on the nonce.
+
+  /**
+   * Fetches the assistant's pending confirmations and adds a card for every one not already on
+   * screen. Called whenever a reply comes back with `action === 'confirm'`, or as soon as the
+   * `confirm` NDJSON line arrives — either way, this is the only place that (indirectly) reads the
+   * nonce off the wire; `confirmPanel` does the actual fetch.
+   */
+  refreshConfirmations() {
+    if (!this.jarvisReady) return
+    return this.confirmPanel.refreshConfirmations()
+  }
+
   toggleHelp(force) {
     const el = this.$('.help')
     const open = force ?? !el.classList.contains('open')
@@ -1258,7 +1279,7 @@ const TEMPLATE = `
 
 <div class="jarvis panel closed">
   <header>Jarvis <span class="j-voice" hidden><button class="j-orb" data-mode="off" aria-label="Jarvis's voice"></button><span class="j-voice-label"></span><button class="btn icon ghost" id="btn-jarvis-mic" title="Mute the mic (M)" aria-pressed="false">${ICON.mic}</button></span><button class="btn icon ghost" id="btn-close-jarvis" title="Close">${ICON.close}</button></header>
-  <div class="body"><div class="j-log"></div></div>
+  <div class="body"><div class="j-confirms"></div><div class="j-log"></div></div>
   <form class="j-ask"><input type="text" placeholder="Ask Jarvis…" autocomplete="off" /></form>
 </div>
 

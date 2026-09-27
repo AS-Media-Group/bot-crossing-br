@@ -215,8 +215,11 @@ const actions = {
    */
   askJarvis: async (question) => {
     const row = hud.addJarvisTurn(question, { text: '…', lane: '', ms: 0 })
-    const reply = await askJarvis(question)
+    // A card can go up mid-answer (the `confirm` NDJSON line) or only be visible once the whole
+    // reply is back (`reply.action === 'confirm'`) — cover both rather than assume which.
+    const reply = await askJarvis(question, { onConfirm: () => hud.refreshConfirmations() })
     hud.fillJarvisTurn(row, question, reply)
+    if (reply.action === 'confirm') hud.refreshConfirmations()
   },
 
   voiceOrb: () => {
