@@ -515,16 +515,51 @@ test('a 404/410/403 still carries a real status in its body, and that body is wh
   })
 })
 
-test('a network failure or an unparsable body reads as unreachable, not an exception', async () => {
+test('a network failure or an unparsable body after the POST reads as an unknown outcome, not "can\u2019t reach the assistant" (I2) \u2014 the action may already have run', async () => {
   await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    // The POST was actually sent in both cases below \u2014 unlike the "nothing configured" case,
+    // where nothing was ever attempted \u2014 so the gateway may already be running the action.
+    // Saying "can't reach the assistant" would be wrong here; the wording must say the outcome is
+    // unknown instead, even though the status name the panel's retry logic keys on is unchanged.
     const thrown = await answerConfirmation({ request_id: 'c_1', nonce: 'n1', decision: 'yes' }, { fetchImpl: async () => { throw new Error('ECONNREFUSED') } })
     assert.equal(thrown.status, 'unreachable')
+    assert.equal(thrown.text, "I didn't hear back, so I can't tell if that went through.")
+    assert.doesNotMatch(thrown.text, /can't reach the assistant/i, 'must not claim the assistant was never reached \u2014 the POST was sent')
 
     const badJson = await answerConfirmation(
       { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
       { fetchImpl: async () => ({ ok: true, json: async () => { throw new SyntaxError('bad') } }) },
     )
     assert.equal(badJson.status, 'unreachable')
+    assert.equal(badJson.text, "I didn't hear back, so I can't tell if that went through.")
+    assert.doesNotMatch(badJson.text, /can't reach the assistant/i)
+  })
+})
+
+test('with nothing configured at all, answerConfirmation still says it cannot reach anything \u2014 the POST was genuinely never sent (I2, contrast case)', async () => {
+  await resetAssistantForTests()
+  const result = await answerConfirmation({ request_id: 'c_1', nonce: 'n1', decision: 'yes' }, { fetchImpl: async () => { throw new Error('should never be called') } })
+  assert.equal(result.status, 'unreachable')
+  assert.match(result.text, /can't reach the assistant/i, 'this one really is "can\u2019t reach it" \u2014 nothing was ever sent')
+})
+
+test('answerConfirmation\u2019s own deadline defaults to 25s (I2) \u2014 up from 4s, so it does not undercut the gateway\u2019s 20s wait for the action to actually run', async () => {
+  await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, async () => {
+    const realTimeout = AbortSignal.timeout
+    let capturedMs = null
+    AbortSignal.timeout = (ms) => {
+      capturedMs = ms
+      return realTimeout(ms)
+    }
+    try {
+      await answerConfirmation(
+        { request_id: 'c_1', nonce: 'n1', decision: 'yes' },
+        { fetchImpl: async () => ({ ok: true, json: async () => ({ status: 'confirmed', reply: { text: 'Done.' } }) }) },
+      )
+    } finally {
+      AbortSignal.timeout = realTimeout
+    }
+    assert.equal(capturedMs, 25000)
   })
 })
 

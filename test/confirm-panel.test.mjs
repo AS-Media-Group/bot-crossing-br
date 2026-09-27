@@ -353,7 +353,10 @@ test('7: a POST that never reaches the assistant keeps the card answerable \u201
       posted.push(body)
       if (firstAttempt) {
         firstAttempt = false
-        return { status: 'unreachable', text: "I couldn't reach the assistant." }
+        // I2: this is what jarvis.js\u2019s answerConfirmation actually returns once the POST was
+        // sent and then failed \u2014 the panel must show exactly this, not a fixed line of its own,
+        // since the action may already have run and "can't reach the assistant" would be wrong.
+        return { status: 'unreachable', text: "I didn't hear back, so I can't tell if that went through." }
       }
       return { status: 'confirmed', text: 'Moved "export.zip" to the Trash.' }
     },
@@ -370,7 +373,7 @@ test('7: a POST that never reaches the assistant keeps the card answerable \u201
   assert.equal(entry.noBtn.disabled, false)
   assert.equal(entry.yesBtn.disabled, false)
   assert.equal(entry.retryEl.hidden, false)
-  assert.equal(entry.retryEl.textContent, "I couldn't reach the assistant. Try again.")
+  assert.equal(entry.retryEl.textContent, "I didn't hear back, so I can't tell if that went through.", 'I2: the card shows the server call\u2019s own text, not a fixed "can\u2019t reach it" line')
   assert.ok(panel.cards.has('c_1'), 'the card is still there, not finished')
 
   // Retry: same nonce goes out again, and this time it's a real answer that finishes the card.
@@ -472,4 +475,66 @@ test('8: an adversarial summary/risk is never turned into markup \u2014 stored a
   // `innerHTML` \u2014 the fake DOM records every write anywhere in the document, so this is a
   // whole-panel guarantee, not just a check of the summary/risk fields above.
   assert.equal(document.innerHTMLWrites.length, 0, 'nothing in the panel ever assigns innerHTML')
+})
+
+// \u2500\u2500 I1 (fix round 1): the injected setTimeout/clearTimeout must be called unbound \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+//
+// A real browser's `setTimeout`/`clearTimeout` are WebIDL operations on `Window`: calling them as
+// `this._setTimeout(...)` invokes them with the panel instance as `this`, and a receiver that is
+// not `Window` (or `undefined`) is refused with "TypeError: Illegal invocation". Node's own
+// `setTimeout` does not check `this` at all, which is why the panel's other tests all passed
+// before this fix even though the panel would have broken in Chromium the moment a card finished.
+// This fake reproduces the browser's check directly, without needing a real browser: it throws
+// unless it is called unbound (`this` is `undefined`, since this module is strict) or explicitly
+// with `globalThis` as the receiver.
+
+function webIdlLikeTimer(impl) {
+  return function (...args) {
+    if (this !== undefined && this !== globalThis) {
+      throw new TypeError("Failed to execute 'setTimeout' on 'Window': Illegal invocation")
+    }
+    return impl(...args)
+  }
+}
+
+test('I1: scheduling a finished card\u2019s cleanup calls setTimeoutImpl unbound, not as this._setTimeout(...)', () => {
+  const { panel } = newPanel({
+    setTimeoutImpl: webIdlLikeTimer(() => 'fake-timer-id'),
+    clearTimeoutImpl: webIdlLikeTimer(() => {}),
+  })
+  panel._addConfirmCard(request())
+  const entry = panel.cards.get('c_1')
+  // Force straight to DONE without going through the real answer() flow (which would also clear
+  // this) \u2014 clear the countdown's own real setInterval by hand so this test leaks nothing.
+  if (entry.timer) {
+    clearInterval(entry.timer)
+    entry.timer = null
+  }
+  entry.card = { ...entry.card, state: CARD_STATES.DONE, text: 'Done.' }
+
+  assert.doesNotThrow(
+    () => panel._renderConfirmOutcome(entry),
+    'a real browser\u2019s setTimeout refuses a `this` that is not the window \u2014 the panel must never call it as this._setTimeout(...)',
+  )
+})
+
+test('I1: clearing a finished card\u2019s timer calls clearTimeoutImpl unbound, not as this._clearTimeout(...)', () => {
+  const { panel } = newPanel({
+    setTimeoutImpl: webIdlLikeTimer(() => 'fake-timer-id'),
+    clearTimeoutImpl: webIdlLikeTimer(() => {}),
+  })
+  panel._addConfirmCard(request())
+  const entry = panel.cards.get('c_1')
+  if (entry.timer) {
+    clearInterval(entry.timer)
+    entry.timer = null
+  }
+  entry.card = { ...entry.card, state: CARD_STATES.DONE, text: 'Done.' }
+  panel._renderConfirmOutcome(entry)
+
+  assert.doesNotThrow(
+    () => panel._removeFinishedCard(entry.card.requestId),
+    'a real browser\u2019s clearTimeout refuses a `this` that is not the window \u2014 the panel must never call it as this._clearTimeout(...)',
+  )
+  assert.equal(panel.cards.size, 0, 'the card was still removed \u2014 the fix does not skip the cleanup, only the receiver')
 })

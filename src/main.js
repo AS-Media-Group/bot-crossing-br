@@ -107,6 +107,9 @@ function startVoice() {
       if (!voiceTurn) return
       hud.fillJarvisTurn(voiceTurn.row, voiceTurn.text, reply)
       voiceTurn = null
+      // I3: a card can go up from a voice turn too \u2014 the typed path already does this (askJarvis
+      // action, below); voice was missing it, so a card opened by voice never rendered.
+      if (reply?.action === 'confirm') hud.refreshConfirmations()
     },
     // Each time the audio connection comes back, check Jarvis again: it may have been reinstalled.
     onReconnect: () => checkJarvis(),

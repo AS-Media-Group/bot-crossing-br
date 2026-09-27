@@ -37,7 +37,13 @@ import {
 
 /** Shown when a `confirm` signal promised a card and nothing ends up on screen for it (item 7). */
 const CANT_SHOW = "I can't reach the assistant to show the card."
-/** Shown on the card itself when one POST never reached the assistant — it stays answerable. */
+/**
+ * Fallback only (I2): the card shows `result.text` from `answerConfirmation` itself, since
+ * jarvis.js already tells apart "never even sent" from "sent, but no answer came back" and words
+ * each one correctly — saying a fixed "can't reach it" line here regardless would undo that
+ * distinction right where it matters (the action may already have run). This is used only if a
+ * caller's `answerConfirmation` somehow returns no text at all.
+ */
 const RETRY_LINE = "I couldn't reach the assistant. Try again."
 /** The visible countdown ticks every second; the screen-reader announcement fires only here. */
 const ANNOUNCE_AT = [30, 10]
@@ -216,9 +222,11 @@ export class ConfirmPanel {
 
       if (result.status === 'unreachable') {
         // Nothing was spent — the nonce this card was created with is still good, and the card
-        // stays answerable until it actually expires (item 7).
+        // stays answerable until it actually expires (item 7). I2: show the caller's own text —
+        // jarvis.js already words "never sent" and "sent, but no answer came back" differently,
+        // and only it knows which one happened.
         entry.card = markUnreachable(entry.card)
-        entry.retryEl.textContent = RETRY_LINE
+        entry.retryEl.textContent = result.text || RETRY_LINE
         entry.retryEl.hidden = false
         entry.noBtn.disabled = false
         entry.yesBtn.disabled = false
@@ -277,14 +285,21 @@ export class ConfirmPanel {
     // M-8: the outcome stays on screen for a short while, then the card is cleared out of
     // `this.cards` entirely — otherwise the map only ever grows, `this.cards.size` never
     // returns to 0, and a later `confirm` signal can never show the "can't reach it" placeholder.
-    entry.finishTimer = this._setTimeout(() => this._removeFinishedCard(entry.card.requestId), FINISHED_VISIBLE_MS)
+    // I1: called unbound (a plain reference, not `this._setTimeout(...)`) — a real browser's
+    // `setTimeout` is a WebIDL operation on `Window` and refuses a `this` that is not the window,
+    // and calling it as a method of this panel instance throws "Illegal invocation" in Chromium
+    // (Node's own `setTimeout` does not check `this`, which is how this went unnoticed).
+    const scheduleTimeout = this._setTimeout
+    entry.finishTimer = scheduleTimeout(() => this._removeFinishedCard(entry.card.requestId), FINISHED_VISIBLE_MS)
   }
 
   _removeFinishedCard(requestId) {
     const entry = this.cards.get(requestId)
     if (!entry) return
     if (entry.finishTimer) {
-      this._clearTimeout(entry.finishTimer)
+      // I1: same reasoning as above — called unbound, never as this._clearTimeout(...).
+      const cancelTimeout = this._clearTimeout
+      cancelTimeout(entry.finishTimer)
       entry.finishTimer = null
     }
     entry.el.remove()

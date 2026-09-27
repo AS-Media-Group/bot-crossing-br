@@ -242,6 +242,17 @@ export async function askJarvis(question, opts) {
 
 const CONFIRM_UNREACHABLE = "I can't reach the assistant \u2014 it does not seem to be running."
 
+/**
+ * Shown when the POST to `/v1/confirm` was actually sent and then failed \u2014 it timed out, the
+ * network dropped, or the body that came back was not JSON (I2). Unlike `CONFIRM_UNREACHABLE`, the
+ * assistant may well have received it: the gateway waits up to 20s to run the action before
+ * answering, so saying "can't reach the assistant" here would be wrong at exactly the moment it
+ * matters most \u2014 the action may have already happened. The nonce is still not spent client-side,
+ * so a retry sends the very same one again; the gateway deletes a request after one answer, so if
+ * the first attempt did land, the retry comes back `status: 'unknown'` from the gateway itself.
+ */
+const CONFIRM_UNKNOWN_OUTCOME = "I didn't hear back, so I can't tell if that went through."
+
 /** A plain sentence for a status the server did not send its own `reply.text` alongside. */
 const CONFIRM_STATUS_TEXT = {
   confirmed: 'Done.',
@@ -296,12 +307,17 @@ export async function pendingConfirmations(opts) {
  * real `status`, so that body is always read, never just the HTTP status code.
  *
  * Returns `{status, text}`: `text` is the server's own `reply.text` when it sent one (the outcome
- * of whatever the card asked to do), otherwise a plain sentence for the status. A request that
- * never reached the assistant at all — no `url` configured, the network failed, the body was not
- * JSON — reads as `status: 'unreachable'` (this file's own name for it; the gateway never sends
- * it), with the same "can't reach it" sentence `askJarvis` uses elsewhere in this file.
+ * of whatever the card asked to do), otherwise a plain sentence for the status. Two failure shapes
+ * both read as `status: 'unreachable'` (this file's own name for it; the gateway never sends it),
+ * but with different wording (I2): nothing configured at all \u2014 the POST was never even attempted \u2014
+ * gets `CONFIRM_UNREACHABLE`, the same "can't reach it" sentence `askJarvis` uses elsewhere in this
+ * file; a POST that was actually sent and then timed out, failed on the network, or came back with
+ * a body that was not JSON gets `CONFIRM_UNKNOWN_OUTCOME` instead, since the assistant may already
+ * have run the action by the time this gives up. The default deadline (25s) is deliberately longer
+ * than the gateway's own 20s wait for the action to run before it answers, so a slow-but-successful
+ * "Yes" does not itself manufacture the very failure this distinction exists to word carefully.
  */
-export async function answerConfirmation({ request_id, nonce, decision }, { fetchImpl = fetch, timeoutMs = 4000 } = {}) {
+export async function answerConfirmation({ request_id, nonce, decision }, { fetchImpl = fetch, timeoutMs = 25000 } = {}) {
   const { url, token } = cached
   if (!url) return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
   let res
@@ -313,13 +329,15 @@ export async function answerConfirmation({ request_id, nonce, decision }, { fetc
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
-    return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
+    // The POST was already sent \u2014 see CONFIRM_UNKNOWN_OUTCOME's own comment for why this must not
+    // say "can't reach the assistant".
+    return { status: 'unreachable', text: CONFIRM_UNKNOWN_OUTCOME }
   }
   let body
   try {
     body = await res.json()
   } catch {
-    return { status: 'unreachable', text: CONFIRM_UNREACHABLE }
+    return { status: 'unreachable', text: CONFIRM_UNKNOWN_OUTCOME }
   }
   const status = body?.status || 'unknown'
   const text = body?.reply?.text || CONFIRM_STATUS_TEXT[status] || CONFIRM_UNREACHABLE
