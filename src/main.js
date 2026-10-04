@@ -109,7 +109,11 @@ function startVoice() {
       voiceTurn = null
       // I3: a card can go up from a voice turn too \u2014 the typed path already does this (askJarvis
       // action, below); voice was missing it, so a card opened by voice never rendered.
-      if (reply?.action === 'confirm') hud.refreshConfirmations()
+      // Gate G5 (04.10.26): and every answer reconciles the cards on screen, not only a `confirm`
+      // one -- "cancel it" by voice left its card drawn: the server declined it and Jarvis said so,
+      // but nothing here asked the panel to look again. A `confirm` reply promised a card; any
+      // other answer asks only for the cards the server has since settled to come off.
+      hud.refreshConfirmations({ expectCard: reply?.action === 'confirm' })
     },
     // Each time the audio connection comes back, check Jarvis again: it may have been reinstalled.
     onReconnect: () => checkJarvis(),
@@ -222,7 +226,10 @@ const actions = {
     // reply is back (`reply.action === 'confirm'`) — cover both rather than assume which.
     const reply = await askJarvis(question, { onConfirm: () => hud.refreshConfirmations() })
     hud.fillJarvisTurn(row, question, reply)
-    if (reply.action === 'confirm') hud.refreshConfirmations()
+    // Gate G5 (04.10.26): after every answer, not just a `confirm` one -- "Okay, cancelled." (or a
+    // `jarvis confirm` from the Mac, or an expiry) has to clear a card the server already settled.
+    // Only a `confirm` reply promised a card; an ordinary one is a reconcile-only refresh.
+    hud.refreshConfirmations({ expectCard: reply.action === 'confirm' })
   },
 
   voiceOrb: () => {

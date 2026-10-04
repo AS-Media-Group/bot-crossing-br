@@ -18,6 +18,7 @@ import {
   markSending,
   markUnreachable,
   newRequests,
+  staleRequestIds,
 } from '../src/game/confirm-cards.js'
 
 const REQUEST = {
@@ -132,6 +133,48 @@ test('an empty or missing pending list, or no shown set at all, never throws', (
   assert.deepEqual(newRequests([{ request_id: 'c_1' }], undefined), [{ request_id: 'c_1' }])
   // A malformed entry (no id) is simply skipped, not a crash.
   assert.deepEqual(newRequests([null, {}], new Set()), [])
+})
+
+// -- Gate G5 (04.10.26): which cards on screen the assistant no longer lists --------------------
+
+test('Gate G5 (04.10.26): an idle card the pending list no longer holds is stale, one it still holds is not', () => {
+  const cards = [
+    { requestId: 'c_1', state: CARD_STATES.IDLE },
+    { requestId: 'c_2', state: CARD_STATES.IDLE },
+  ]
+  assert.deepEqual(staleRequestIds([{ request_id: 'c_2' }], cards), ['c_1'])
+  assert.deepEqual(staleRequestIds([{ request_id: 'c_1' }, { request_id: 'c_2' }], cards), [])
+  // An empty list that came back from a SUCCESSFUL fetch is real information: nothing is pending.
+  assert.deepEqual(staleRequestIds([], cards), ['c_1', 'c_2'])
+})
+
+test('Gate G5 (04.10.26): only an idle card can be stale -- one mid-answer or already finished is left to its own flow', () => {
+  const cards = [
+    { requestId: 'c_idle', state: CARD_STATES.IDLE },
+    { requestId: 'c_sending', state: CARD_STATES.SENDING },
+    { requestId: 'c_done', state: CARD_STATES.DONE },
+    { requestId: 'c_expired', state: CARD_STATES.EXPIRED },
+  ]
+  assert.deepEqual(staleRequestIds([], cards), ['c_idle'])
+})
+
+test('Gate G5 (04.10.26): a pending list that is not a list says nothing about what is settled, so nothing is stale', () => {
+  const cards = [{ requestId: 'c_1', state: CARD_STATES.IDLE }]
+  for (const pending of [undefined, null, 'nope', {}, 7]) {
+    assert.deepEqual(staleRequestIds(pending, cards), [], `a non-list (${JSON.stringify(pending)}) must not read as "nothing pending"`)
+  }
+  // No cards at all, or a missing card set, never throws either; a malformed pending entry is skipped.
+  assert.deepEqual(staleRequestIds([], []), [])
+  assert.deepEqual(staleRequestIds([], undefined), [])
+  assert.deepEqual(staleRequestIds([null, {}, { request_id: 'c_1' }], cards), [])
+})
+
+test('Gate G5 (04.10.26): the card set may be any iterable of card models, such as the values of a Map', () => {
+  const byId = new Map([
+    ['c_1', { requestId: 'c_1', state: CARD_STATES.IDLE }],
+    ['c_2', { requestId: 'c_2', state: CARD_STATES.IDLE }],
+  ])
+  assert.deepEqual(staleRequestIds([{ request_id: 'c_1' }], byId.values()), ['c_2'])
 })
 
 // ── security (contract §14): the nonce is never in anything this file writes out ─────────

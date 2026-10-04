@@ -538,3 +538,259 @@ test('I1: clearing a finished card\u2019s timer calls clearTimeoutImpl unbound, 
   )
   assert.equal(panel.cards.size, 0, 'the card was still removed \u2014 the fix does not skip the cleanup, only the receiver')
 })
+
+// -- Gate G5 (04.10.26): a card the server already settled leaves the screen ----------------------
+//
+// Live evidence: "cancel it" said by voice with a card up. The assistant declined the card on
+// the server and said "Okay, cancelled.", but the card stayed drawn in the window. `_doRefresh` only
+// ever ADDED cards, and a card left the screen only when it was answered on the panel itself or its
+// own countdown ran out. Now every SUCCESSFUL fetch of the pending list also takes off any card that
+// is still idle and no longer listed, and main.js asks for one after every answer with
+// `{ expectCard: false }` -- a reconcile-only refresh. Nothing pending is then no business of the
+// "can't reach it" placeholder, which stays for a confirm signal that promised a card.
+
+/** A pending-list stub a test can change between refreshes, counting how many fetches were made. */
+const livePending = (initial = []) => {
+  const state = { requests: initial, ok: true, calls: 0 }
+  state.fetch = async () => {
+    state.calls += 1
+    return state.ok ? { ok: true, requests: state.requests } : { ok: false, requests: [] }
+  }
+  return state
+}
+
+const hasPlaceholder = (container) => container.children.some((c) => c.className === 'j-confirm-placeholder')
+const CANT_SHOW_TEXT = "I can't reach the assistant to show the card."
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+test('Gate G5 (04.10.26): a card the server already settled is removed by an answer-triggered refresh, and no placeholder takes its place', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request()])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations()
+  assert.equal(panel.cards.size, 1)
+  assert.equal(container.children.length, 1)
+
+  pending.requests = [] // "cancel it": the assistant declined the card on the server
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(panel.cards.size, 0, 'the card is off the screen')
+  assert.equal(container.children.length, 0, 'its element is gone, and nothing (no placeholder) took its place')
+})
+
+test('Gate G5 (04.10.26): a card removed because the server settled it stops ticking and can no longer be answered', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const answered = []
+  const pending = livePending([request()])
+  const { panel } = newPanel({
+    pendingConfirmations: pending.fetch,
+    answerConfirmation: async (body) => {
+      answered.push(body)
+      return { status: 'confirmed', text: 'Done.' }
+    },
+  })
+  await panel.refreshConfirmations()
+  const entry = panel.cards.get('c_1')
+  assert.ok(entry.timer, 'its countdown is ticking while it is up')
+
+  pending.requests = []
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(entry.timer, null, 'its countdown interval was cleared -- nothing orphaned')
+  t.mock.timers.tick(120_000)
+  assert.equal(panel.cards.size, 0, 'and nothing brings it back')
+
+  // A stray click on a button that is no longer on screen goes nowhere: nothing is sent, nonce included.
+  entry.yesBtn.dispatch('click')
+  entry.noBtn.dispatch('click')
+  await tick()
+  assert.deepEqual(answered, [])
+})
+
+test('Gate G5 (04.10.26): a card mid-answer is not removed even though the server no longer lists it -- its own answer flow finishes it', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  let resolveAnswer
+  const { container, panel } = newPanel({
+    pendingConfirmations: async () => ({ ok: true, requests: [] }),
+    answerConfirmation: () =>
+      new Promise((resolve) => {
+        resolveAnswer = resolve
+      }),
+  })
+  panel._addConfirmCard(request({ expires_at: Date.now() + 60_000 }))
+  const entry = panel.cards.get('c_1')
+  entry.yesBtn.dispatch('click') // the POST is in flight; the server has already consumed the request
+  assert.equal(entry.card.state, 'sending')
+
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(panel.cards.get('c_1'), entry, 'still the same entry')
+  assert.equal(container.children.length, 1, 'still on screen, and no placeholder beside it')
+
+  resolveAnswer({ status: 'confirmed', text: 'Moved "export.zip" to the Trash.' })
+  await tick()
+  assert.equal(entry.card.state, 'done', 'its own flow finished it')
+  assert.equal(entry.outcomeEl.textContent, 'Moved "export.zip" to the Trash.')
+})
+
+test('Gate G5 (04.10.26): a finished card is not removed by a reconcile either -- its outcome clears on its own timer', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request({ expires_at: Date.now() + 60_000 })])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations()
+  const entry = panel.cards.get('c_1')
+  entry.yesBtn.dispatch('click')
+  await tick()
+  assert.equal(entry.card.state, 'done')
+
+  pending.requests = [] // the answered request is gone from the server's list, as it always is
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(panel.cards.get('c_1'), entry, 'the finished entry is left alone')
+  assert.equal(entry.outcomeEl.hidden, false, 'its outcome is still showing')
+  assert.equal(entry.outcomeEl.textContent, 'Done.')
+  assert.equal(container.children.length, 1)
+
+  t.mock.timers.tick(FINISHED_VISIBLE_MS)
+  assert.equal(panel.cards.size, 0, 'it clears on its own timer, as before')
+})
+
+test('Gate G5 (04.10.26): a fetch that fails or comes back malformed removes nothing, and shows no placeholder for an ordinary answer', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const shapes = {
+    'not ok': async () => ({ ok: false, requests: [] }),
+    'rejects': async () => {
+      throw new Error('network down')
+    },
+    'ok but no list': async () => ({ ok: true }),
+    'ok but not a list': async () => ({ ok: true, requests: 'nope' }),
+  }
+  for (const [name, shape] of Object.entries(shapes)) {
+    for (const options of [{ expectCard: false }, undefined]) {
+      let next = async () => ({ ok: true, requests: [request()] })
+      const { container, panel } = newPanel({ pendingConfirmations: () => next() })
+      await panel.refreshConfirmations()
+      const entry = panel.cards.get('c_1')
+      assert.ok(entry, `${name}: the card went up`)
+
+      next = shape
+      await panel.refreshConfirmations(options)
+      const label = `${name}, ${JSON.stringify(options)}`
+      assert.equal(panel.cards.get('c_1'), entry, `${label}: the card on screen is untouched`)
+      assert.equal(container.children.length, 1, `${label}: only the card is on screen -- no placeholder`)
+      assert.equal(entry.card.state, 'idle', `${label}: still answerable`)
+    }
+  }
+})
+
+test('Gate G5 (04.10.26): an answer-triggered refresh that finds nothing pending shows no placeholder', async () => {
+  for (const result of [{ ok: true, requests: [] }, { ok: false, requests: [] }]) {
+    const { container, panel } = newPanel({ pendingConfirmations: async () => result })
+    await panel.refreshConfirmations({ expectCard: false })
+    assert.equal(panel.cards.size, 0)
+    assert.equal(container.children.length, 0, `ok=${result.ok}: nothing was promised, so nothing is said`)
+  }
+})
+
+test('Gate G5 (04.10.26): a confirm-promised refresh with nothing pending still shows the placeholder, asked for explicitly or by default', async () => {
+  for (const options of [{ expectCard: true }, {}, undefined]) {
+    for (const result of [{ ok: true, requests: [] }, { ok: false, requests: [] }]) {
+      const { container, panel } = newPanel({ pendingConfirmations: async () => result })
+      await panel.refreshConfirmations(options)
+      assert.equal(container.children.length, 1, `${JSON.stringify(options)} ok=${result.ok}`)
+      assert.equal(container.children[0].className, 'j-confirm-placeholder')
+      assert.equal(container.children[0].textContent, CANT_SHOW_TEXT)
+    }
+  }
+})
+
+test('Gate G5 (04.10.26): a confirm-promised refresh also reconciles -- a settled card goes, and if the promised card is not there either, the placeholder shows', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request()])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations()
+  assert.equal(panel.cards.size, 1)
+
+  pending.requests = [] // the old card was settled, and the one the signal promised has already gone too
+  await panel.refreshConfirmations({ expectCard: true })
+  assert.equal(panel.cards.size, 0, 'the settled card is gone')
+  assert.ok(hasPlaceholder(container), 'nothing is on screen for the card that was promised')
+})
+
+test('Gate G5 (04.10.26): a confirm-promised call joining a reconcile-only fetch already in flight still gets the placeholder, with one GET only (ruling 6)', async () => {
+  let fetchCalls = 0
+  let resolveFetch
+  const { container, panel } = newPanel({
+    pendingConfirmations: () =>
+      new Promise((resolve) => {
+        fetchCalls += 1
+        resolveFetch = resolve
+      }),
+  })
+  const reconcileOnly = panel.refreshConfirmations({ expectCard: false })
+  const promised = panel.refreshConfirmations({ expectCard: true }) // must join the fetch, not start a second one
+  assert.equal(fetchCalls, 1, 'still never more than one GET outstanding')
+  resolveFetch({ ok: true, requests: [] })
+  await Promise.all([reconcileOnly, promised])
+  assert.ok(hasPlaceholder(container), 'the promise was not lost by joining a fetch that started without it')
+})
+
+test('Gate G5 (04.10.26): a reconcile-only call joining a confirm-promised fetch already in flight does not downgrade it', async () => {
+  let fetchCalls = 0
+  let resolveFetch
+  const { container, panel } = newPanel({
+    pendingConfirmations: () =>
+      new Promise((resolve) => {
+        fetchCalls += 1
+        resolveFetch = resolve
+      }),
+  })
+  const promised = panel.refreshConfirmations({ expectCard: true })
+  const reconcileOnly = panel.refreshConfirmations({ expectCard: false })
+  assert.equal(fetchCalls, 1)
+  resolveFetch({ ok: true, requests: [] })
+  await Promise.all([promised, reconcileOnly])
+  assert.ok(hasPlaceholder(container), 'the mid-stream confirm signal still gets its placeholder')
+})
+
+test('Gate G5 (04.10.26): what a refresh expects is not sticky -- the next one starts from its own option', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request()])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await Promise.all([panel.refreshConfirmations({ expectCard: true }), panel.refreshConfirmations({ expectCard: false })])
+  assert.equal(pending.calls, 1, 'the two overlapping calls shared one fetch')
+  assert.equal(panel.cards.size, 1)
+
+  pending.requests = []
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(pending.calls, 2, 'a fresh fetch once the first had landed')
+  assert.equal(panel.cards.size, 0)
+  assert.equal(container.children.length, 0, 'no placeholder -- the earlier promise was not carried over into this refresh')
+})
+
+test('Gate G5 (04.10.26): only the settled card goes -- another still pending keeps its entry and its countdown', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const other = request({ request_id: 'c_2', action: { tool: 'files.trash', summary: 'Trash the other export?', risk: 'delete' } })
+  const pending = livePending([request({ request_id: 'c_1' }), other])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations()
+  const second = panel.cards.get('c_2')
+  assert.equal(panel.cards.size, 2)
+
+  pending.requests = [other]
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(panel.cards.has('c_1'), false, 'the settled card is gone')
+  assert.equal(panel.cards.get('c_2'), second, 'the one still pending is the very same entry')
+  assert.ok(second.timer, 'and still ticking')
+  assert.equal(container.children.length, 1)
+  assert.equal(container.children[0], second.el)
+})
+
+test('Gate G5 (04.10.26): one refresh can take off a settled card and put up a new one, and the new one takes the default focus on No', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request({ request_id: 'c_1' })])
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations()
+
+  pending.requests = [request({ request_id: 'c_2' })]
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.deepEqual([...panel.cards.keys()], ['c_2'])
+  assert.equal(container.children.length, 1)
+  assert.equal(panel.cards.get('c_2').noBtn._focused, true, 'it is the first card on screen again, so it gets the default focus')
+})

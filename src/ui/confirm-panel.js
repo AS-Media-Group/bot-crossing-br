@@ -29,6 +29,7 @@ import {
   markSending,
   markUnreachable,
   newRequests,
+  staleRequestIds,
 } from '../game/confirm-cards.js'
 import {
   answerConfirmation as defaultAnswerConfirmation,
@@ -74,6 +75,8 @@ export class ConfirmPanel {
     // retryEl, outcomeEl }. No nonce field, ever — see the header.
     this.cards = new Map()
     this._refreshInFlight = null
+    // Whether the fetch in flight (or the next one) was promised a card -- see refreshConfirmations().
+    this._expectCard = true
     this._placeholderEl = null
   }
 
@@ -85,9 +88,23 @@ export class ConfirmPanel {
    * (`reply.action === 'confirm'`) for the *same* card (ruling 6): an in-flight guard collapses an
    * overlapping second call into the one fetch already running, so there is never more than one
    * `GET /v1/confirm` outstanding, and so never two attempts racing to add the same card.
+   *
+   * Gate G5 (04.10.26): a fetch that SUCCEEDS also takes off any card still waiting for a click
+   * that the assistant no longer lists (answered some other way, or expired on its side), and
+   * `main.js` now calls this after every answer, typed or spoken, not just a `confirm` one.
+   * `expectCard` tells the two kinds of call apart: a `confirm` signal promised a card, so it is
+   * the default and keeps the old behaviour (nothing on screen once the fetch lands means the
+   * "can't reach it" placeholder); an ordinary answer passes `{ expectCard: false }` and gets a
+   * reconcile-only refresh that never shows the placeholder, since nothing was promised. A call
+   * that joins a fetch already in flight can only RAISE what that fetch expects, never lower it,
+   * so a mid-stream `confirm` signal is not downgraded by an ordinary answer landing on top of it.
    */
-  refreshConfirmations() {
-    if (this._refreshInFlight) return this._refreshInFlight
+  refreshConfirmations({ expectCard = true } = {}) {
+    if (this._refreshInFlight) {
+      this._expectCard = this._expectCard || expectCard
+      return this._refreshInFlight
+    }
+    this._expectCard = expectCard
     this._refreshInFlight = this._doRefresh().finally(() => {
       this._refreshInFlight = null
     })
@@ -101,16 +118,27 @@ export class ConfirmPanel {
     } catch {
       result = { ok: false, requests: [] }
     }
-    const requests = Array.isArray(result?.requests) ? result.requests : []
-    if (result?.ok) {
+    // Only a fetch that succeeded AND handed back a real list says anything about what is pending:
+    // a failed or malformed one must never take a card off the screen.
+    const requests = result?.ok && Array.isArray(result.requests) ? result.requests : null
+    if (requests) {
+      // Gate G5 (04.10.26): off first, then on, so a card that arrives in this same refresh counts
+      // as the first on screen again (the default focus). Only a card still idle goes -- one
+      // mid-answer or already showing its outcome is left to its own flow -- and it goes through
+      // the same teardown as an expiry: its interval cleared, its element removed, and shut to
+      // answers first, so a click that somehow reached its detached buttons sends nothing.
+      const models = Array.from(this.cards.values(), (entry) => entry.card)
+      for (const id of staleRequestIds(requests, models)) this._expireConfirmCard(id)
       for (const request of newRequests(requests, new Set(this.cards.keys()))) this._addConfirmCard(request)
     }
     // A `confirm` signal promised a card. If nothing is on screen once this fetch has landed —
     // it failed outright, or it succeeded but came back with nothing (a race with the request
     // already having been answered or expired elsewhere) — say so, rather than leaving the panel
     // looking like the click never happened. A card already showing is left alone either way.
-    if (this.cards.size === 0) this._showPlaceholder(CANT_SHOW)
-    else this._clearPlaceholder()
+    // An ordinary answer promised nothing (Gate G5): an empty panel after one is just an empty
+    // panel, so it never raises the placeholder (a card showing still clears it, as ever).
+    if (this.cards.size > 0) this._clearPlaceholder()
+    else if (this._expectCard) this._showPlaceholder(CANT_SHOW)
   }
 
   _showPlaceholder(text) {

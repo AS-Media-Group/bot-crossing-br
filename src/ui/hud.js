@@ -1052,10 +1052,15 @@ export class Hud {
    * screen. Called whenever a reply comes back with `action === 'confirm'`, or as soon as the
    * `confirm` NDJSON line arrives — either way, this is the only place that (indirectly) reads the
    * nonce off the wire; `confirmPanel` does the actual fetch.
+   *
+   * Gate G5 (04.10.26): it is also called after every other answer, typed or spoken, so a card the
+   * assistant has since settled comes off the screen. `options` goes straight through to the panel:
+   * `{ expectCard: false }` for an ordinary answer, nothing for a `confirm` signal (which promised a
+   * card) -- see `ConfirmPanel.refreshConfirmations`.
    */
-  refreshConfirmations() {
+  refreshConfirmations(options) {
     if (!this.jarvisReady) return
-    return this.confirmPanel.refreshConfirmations()
+    return this.confirmPanel.refreshConfirmations(options)
   }
 
   toggleHelp(force) {

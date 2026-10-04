@@ -6,8 +6,9 @@
  * `GET /v1/confirm` — each with a one-shot `nonce` that answers it — and every card in the panel
  * lives and dies by that list. This file is the part of that worth testing on its own: what state
  * a card is in, what its countdown reads, which of a fresh pending list are cards the panel has
- * not shown yet, and the HTML a card renders as (kept for its own documented shape and tests; the
- * live glue in `confirm-panel.js` builds its DOM directly rather than through this string, so it
+ * not shown yet, which cards on screen that list no longer holds (Gate G5, 04.10.26), and the HTML
+ * a card renders as (kept for its own documented shape and tests; the live glue in
+ * `confirm-panel.js` builds its DOM directly rather than through this string, so it
  * never has to parse anything back out of it — see that file's header for why).
  *
  * No DOM here, and — since ruling B2 — no `nonce` anywhere in this file's model either: `createCard`
@@ -83,4 +84,22 @@ export function countdownText(expiresAt, now = Date.now()) {
 export function newRequests(pending, shownIds) {
   const shown = shownIds || new Set()
   return (pending || []).filter((r) => r && r.request_id && !shown.has(r.request_id))
+}
+
+/**
+ * Gate G5 (04.10.26): the cards on screen the assistant no longer lists -- answered some other way
+ * (a voice "cancel it", `jarvis confirm` from the Mac) or expired on its side. Only a card still
+ * IDLE counts: one mid-answer (SENDING) or already finished (DONE) belongs to its own flow, which
+ * is about to put its outcome on screen, and the server will already have dropped its request from
+ * the list by then. `pending` must be the real list from a fetch that SUCCEEDED -- anything else
+ * says nothing about what is settled, so nothing is stale. `cards` is any iterable of card models.
+ */
+export function staleRequestIds(pending, cards) {
+  if (!Array.isArray(pending)) return []
+  const listed = new Set(pending.filter((r) => r && r.request_id).map((r) => r.request_id))
+  const stale = []
+  for (const card of cards || []) {
+    if (card && card.state === CARD_STATES.IDLE && !listed.has(card.requestId)) stale.push(card.requestId)
+  }
+  return stale
 }
