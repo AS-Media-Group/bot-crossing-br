@@ -75,8 +75,12 @@ export class ConfirmPanel {
     // retryEl, outcomeEl }. No nonce field, ever — see the header.
     this.cards = new Map()
     this._refreshInFlight = null
-    // Whether the fetch in flight (or the next one) was promised a card -- see refreshConfirmations().
+    // Whether the fetch now in flight was promised a card -- see refreshConfirmations(). It is the
+    // expectation the fetch STARTED with and is never raised once it is out (see _followUp below).
     this._expectCard = true
+    // Set when a call that promises a card joins a fetch that was sent without that promise: one
+    // more fetch runs once the one in flight has landed, and the promise is decided on that.
+    this._followUp = false
     this._placeholderEl = null
   }
 
@@ -96,22 +100,43 @@ export class ConfirmPanel {
    * the default and keeps the old behaviour (nothing on screen once the fetch lands means the
    * "can't reach it" placeholder); an ordinary answer passes `{ expectCard: false }` and gets a
    * reconcile-only refresh that never shows the placeholder, since nothing was promised. A call
-   * that joins a fetch already in flight can only RAISE what that fetch expects, never lower it,
-   * so a mid-stream `confirm` signal is not downgraded by an ordinary answer landing on top of it.
+   * that joins a fetch already in flight never lowers what that fetch expects, so a mid-stream
+   * `confirm` signal is not downgraded by an ordinary answer landing on top of it.
+   *
+   * G5 review (04.10.26): a promise cannot be handed to a fetch that was sent without it. Such a
+   * fetch went out before the card the promise is about necessarily existed on the server, so it can
+   * land empty, and deciding "nothing to show" on it would put the "can't reach it" line up for a
+   * card that was a moment away. So a call that RAISES the expectation from false to true while a
+   * fetch is in flight sets a follow-up: once that fetch has landed, exactly ONE more fetch runs and
+   * the add / placeholder decision for the promise is made on it. The fetch in flight is never joined
+   * by a second one (ruling 6: still at most one GET outstanding), and everyone who joined gets the
+   * one promise, which settles when the follow-up has. A mid-stream `confirm` signal and the final
+   * reply for the same card are both promised from the start, raise nothing, and still share one GET.
    */
   refreshConfirmations({ expectCard = true } = {}) {
     if (this._refreshInFlight) {
-      this._expectCard = this._expectCard || expectCard
+      if (expectCard && !this._expectCard) this._followUp = true
       return this._refreshInFlight
     }
     this._expectCard = expectCard
-    this._refreshInFlight = this._doRefresh().finally(() => {
+    this._followUp = false
+    this._refreshInFlight = this._run().finally(() => {
       this._refreshInFlight = null
     })
     return this._refreshInFlight
   }
 
-  async _doRefresh() {
+  /** The fetch that was asked for, then the one follow-up if a promise joined it too late (see above). */
+  async _run() {
+    await this._doRefresh(this._expectCard)
+    if (this._followUp) {
+      this._followUp = false
+      this._expectCard = true // calls joining the follow-up find the promise already in it: they raise nothing
+      await this._doRefresh(true)
+    }
+  }
+
+  async _doRefresh(expectCard) {
     let result
     try {
       result = await this._pendingConfirmations()
@@ -137,8 +162,12 @@ export class ConfirmPanel {
     // looking like the click never happened. A card already showing is left alone either way.
     // An ordinary answer promised nothing (Gate G5): an empty panel after one is just an empty
     // panel, so it never raises the placeholder (a card showing still clears it, as ever).
+    // G5 review: and if it SUCCEEDED with an empty list, the server says nothing is pending, so a
+    // "can't reach it" line left by an earlier failed promise is stale and comes down with it. A
+    // failed or malformed fetch says nothing either way and leaves the line where it was.
     if (this.cards.size > 0) this._clearPlaceholder()
-    else if (this._expectCard) this._showPlaceholder(CANT_SHOW)
+    else if (expectCard) this._showPlaceholder(CANT_SHOW)
+    else if (requests && requests.length === 0) this._clearPlaceholder()
   }
 
   _showPlaceholder(text) {

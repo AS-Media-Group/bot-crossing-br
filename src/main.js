@@ -104,16 +104,19 @@ function startVoice() {
       voiceTurn = { text, row: hud.addJarvisTurn(text, { text: '…', lane: '', ms: 0 }) }
     },
     onAnswer: (reply) => {
-      if (!voiceTurn) return
-      hud.fillJarvisTurn(voiceTurn.row, voiceTurn.text, reply)
-      voiceTurn = null
       // I3: a card can go up from a voice turn too \u2014 the typed path already does this (askJarvis
       // action, below); voice was missing it, so a card opened by voice never rendered.
       // Gate G5 (04.10.26): and every answer reconciles the cards on screen, not only a `confirm`
       // one -- "cancel it" by voice left its card drawn: the server declined it and Jarvis said so,
       // but nothing here asked the panel to look again. A `confirm` reply promised a card; any
       // other answer asks only for the cards the server has since settled to come off.
+      // G5 review: this runs BEFORE the row check below. The row can already be closed ("Stopped.",
+      // a new wake word) while the answer still arrives, and the server has acted on it all the same,
+      // so the cards on screen must be reconciled for a dropped answer too.
       hud.refreshConfirmations({ expectCard: reply?.action === 'confirm' })
+      if (!voiceTurn) return
+      hud.fillJarvisTurn(voiceTurn.row, voiceTurn.text, reply)
+      voiceTurn = null
     },
     // Each time the audio connection comes back, check Jarvis again: it may have been reinstalled.
     onReconnect: () => checkJarvis(),

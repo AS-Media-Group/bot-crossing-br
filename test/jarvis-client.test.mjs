@@ -346,7 +346,7 @@ test('a confirm line in the NDJSON stream reaches the caller\u2019s onConfirm, a
   const lines = [
     '{"type":"ack","text":"on it"}',
     '{"type":"confirm","request_id":"c_1","summary":"Trash the old export?","risk":"delete","expires_at":1700000060000}',
-    '{"type":"reply","reply":{"text":"I\'ve put a card up: Trash the old export?.","detail":"","sources":[],"action":"confirm","lane":"fast","ms":5,"model":null,"session_id":"s1"}}',
+    '{"type":"reply","reply":{"text":"Card up: Trash the old export?","detail":"","sources":[],"action":"confirm","lane":"fast","ms":5,"model":null,"session_id":"s1"}}',
   ]
   const confirms = []
   const reply = await withAssistant({ url: 'https://assistant.example:8443', token: 'tok-1' }, () =>
@@ -354,7 +354,7 @@ test('a confirm line in the NDJSON stream reaches the caller\u2019s onConfirm, a
   )
   assert.deepEqual(confirms, [{ type: 'confirm', request_id: 'c_1', summary: 'Trash the old export?', risk: 'delete', expires_at: 1700000060000 }])
   assert.equal(reply.action, 'confirm')
-  assert.equal(reply.text, 'I\'ve put a card up: Trash the old export?.')
+  assert.equal(reply.text, 'Card up: Trash the old export?')
 })
 
 test('askJarvis with no onConfirm still returns the reply fine \u2014 a caller that does not care about cards is not broken by them', async () => {

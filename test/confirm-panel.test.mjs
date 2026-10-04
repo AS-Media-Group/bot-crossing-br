@@ -713,22 +713,148 @@ test('Gate G5 (04.10.26): a confirm-promised refresh also reconciles -- a settle
   assert.ok(hasPlaceholder(container), 'nothing is on screen for the card that was promised')
 })
 
-test('Gate G5 (04.10.26): a confirm-promised call joining a reconcile-only fetch already in flight still gets the placeholder, with one GET only (ruling 6)', async () => {
-  let fetchCalls = 0
-  let resolveFetch
-  const { container, panel } = newPanel({
-    pendingConfirmations: () =>
-      new Promise((resolve) => {
-        fetchCalls += 1
-        resolveFetch = resolve
-      }),
-  })
+/**
+ * A pending-list stub whose every GET stays outstanding until the test lands it by hand, so a test
+ * can see exactly how many GETs were sent and how many were ever outstanding at the same moment.
+ */
+const manualPending = () => {
+  const state = { gets: [], outstanding: 0, peak: 0 }
+  state.fetch = () =>
+    new Promise((resolve) => {
+      state.outstanding += 1
+      state.peak = Math.max(state.peak, state.outstanding)
+      state.gets.push((value) => {
+        state.outstanding -= 1
+        resolve(value)
+      })
+    })
+  return state
+}
+
+// G5 review (04.10.26). The first version of the in-flight guard made a confirm-promised call that
+// joined a reconcile-only fetch share that one fetch and raised its expectation. But that fetch was
+// sent BEFORE the promised card existed on the server, so it could land empty and the panel would
+// then say "can't reach it" for a card that was a moment away. Now a call that raises the
+// expectation from false to true asks for ONE more fetch once the one in flight has landed, and the
+// add / placeholder decision for the promise is made on that second fetch. Never two GETs at once.
+test('Gate G5 review: a confirm-promised call joining a reconcile-only fetch in flight is served by one more fetch after it lands -- two GETs in turn, never two at once, and the card shows', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = manualPending()
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
   const reconcileOnly = panel.refreshConfirmations({ expectCard: false })
   const promised = panel.refreshConfirmations({ expectCard: true }) // must join the fetch, not start a second one
-  assert.equal(fetchCalls, 1, 'still never more than one GET outstanding')
-  resolveFetch({ ok: true, requests: [] })
+  assert.equal(pending.gets.length, 1, 'joining sends nothing: still one GET outstanding (ruling 6)')
+
+  // That first GET went out before the promised card existed, so it comes back empty.
+  pending.gets[0]({ ok: true, requests: [] })
+  await tick()
+  assert.equal(pending.gets.length, 2, 'once the first landed, exactly one more fetch went out')
+  assert.equal(pending.outstanding, 1, 'and only that one is outstanding')
+  assert.equal(panel.cards.size, 0)
+  assert.equal(hasPlaceholder(container), false, 'the early fetch was promised nothing and says nothing; the decision waits for the second')
+
+  // The second GET sees the card the server has by now.
+  pending.gets[1]({ ok: true, requests: [request()] })
   await Promise.all([reconcileOnly, promised])
-  assert.ok(hasPlaceholder(container), 'the promise was not lost by joining a fetch that started without it')
+  assert.equal(pending.gets.length, 2, 'no third fetch')
+  assert.equal(pending.peak, 1, 'never more than one GET outstanding at any moment')
+  assert.equal(panel.cards.size, 1, 'the card the promise was waiting for is on screen')
+  assert.equal(hasPlaceholder(container), false)
+})
+
+test('Gate G5 review: the one more fetch makes the placeholder decision -- if it also comes back empty, the placeholder shows', async () => {
+  const pending = manualPending()
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  const reconcileOnly = panel.refreshConfirmations({ expectCard: false })
+  const promised = panel.refreshConfirmations({ expectCard: true })
+  pending.gets[0]({ ok: true, requests: [] })
+  await tick()
+  assert.equal(pending.gets.length, 2)
+  assert.equal(hasPlaceholder(container), false, 'not yet: the second fetch has not landed')
+  pending.gets[1]({ ok: true, requests: [] })
+  await Promise.all([reconcileOnly, promised])
+  assert.ok(hasPlaceholder(container), 'the promise was not lost, and nothing is on screen for it')
+  assert.equal(pending.peak, 1)
+})
+
+test('Gate G5 review: a third call joining while the one more fetch is outstanding does not start another -- one extra at most', async () => {
+  const pending = manualPending()
+  const { panel } = newPanel({ pendingConfirmations: pending.fetch })
+  const first = panel.refreshConfirmations({ expectCard: false })
+  const second = panel.refreshConfirmations({ expectCard: true })
+  pending.gets[0]({ ok: true, requests: [] })
+  await tick()
+  assert.equal(pending.gets.length, 2)
+  const third = panel.refreshConfirmations({ expectCard: true }) // the follow-up is already out: join it
+  const fourth = panel.refreshConfirmations({ expectCard: false })
+  assert.equal(pending.gets.length, 2, 'joined, not a third GET')
+  pending.gets[1]({ ok: true, requests: [] })
+  await tick()
+  assert.equal(pending.gets.length, 2, 'and nothing trails behind it')
+  await Promise.all([first, second, third, fourth])
+  assert.equal(pending.peak, 1)
+})
+
+test('Gate G5 review: a joined call that raised the expectation does not leave a follow-up behind for the next refresh', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request()])
+  const { panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await Promise.all([panel.refreshConfirmations({ expectCard: false }), panel.refreshConfirmations({ expectCard: true })])
+  assert.equal(pending.calls, 2, 'the early fetch and its one follow-up')
+  assert.equal(panel.cards.size, 1)
+
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(pending.calls, 3, 'a fresh reconcile is one GET, with no stale follow-up attached')
+  await tick()
+  assert.equal(pending.calls, 3)
+})
+
+test('Gate G5 review: a mid-stream confirm signal and the final reply for the same card, both promised from the start, still collapse into one GET', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
+  const pending = livePending([request()])
+  const { panel } = newPanel({ pendingConfirmations: pending.fetch })
+  const midStream = panel.refreshConfirmations() // onConfirm: expectCard defaults to true
+  const finalReply = panel.refreshConfirmations({ expectCard: true }) // reply.action === 'confirm'
+  await Promise.all([midStream, finalReply])
+  assert.equal(pending.calls, 1, 'one GET for the one card')
+  assert.equal(panel.cards.size, 1)
+  await tick()
+  assert.equal(pending.calls, 1, 'and no follow-up trailing behind it')
+})
+
+test('Gate G5 review: a failed promised refresh leaves the placeholder up, and a later successful empty reconcile takes it down', async () => {
+  const pending = livePending([])
+  pending.ok = false
+  const { container, panel } = newPanel({ pendingConfirmations: pending.fetch })
+  await panel.refreshConfirmations() // promised, and the fetch failed
+  assert.ok(hasPlaceholder(container), 'the promised card could not be shown')
+
+  pending.ok = true // the next answer's reconcile gets through and the server lists nothing
+  await panel.refreshConfirmations({ expectCard: false })
+  assert.equal(panel.cards.size, 0)
+  assert.equal(container.children.length, 0, 'the stale "can\'t reach it" line is gone')
+  assert.equal(panel._placeholderEl, null)
+})
+
+test('Gate G5 review: only a fetch that really succeeded with an empty list clears the placeholder -- a failed or malformed reconcile says nothing', async () => {
+  const shapes = {
+    'not ok': async () => ({ ok: false, requests: [] }),
+    'rejects': async () => {
+      throw new Error('network down')
+    },
+    'ok but no list': async () => ({ ok: true }),
+    'ok but not a list': async () => ({ ok: true, requests: 'nope' }),
+  }
+  for (const [name, shape] of Object.entries(shapes)) {
+    let next = async () => ({ ok: false, requests: [] })
+    const { container, panel } = newPanel({ pendingConfirmations: () => next() })
+    await panel.refreshConfirmations()
+    assert.ok(hasPlaceholder(container), `${name}: placeholder is up`)
+
+    next = shape
+    await panel.refreshConfirmations({ expectCard: false })
+    assert.ok(hasPlaceholder(container), `${name}: a fetch that told nothing leaves the placeholder where it was`)
+  }
 })
 
 test('Gate G5 (04.10.26): a reconcile-only call joining a confirm-promised fetch already in flight does not downgrade it', async () => {
