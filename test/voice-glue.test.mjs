@@ -140,11 +140,13 @@ function installFakes({ ctxRunning = false } = {}) {
   }
 
   let getUserMediaCalls = 0
+  let lastConstraints = null
   const streams = []
   defineGlobal('navigator', {
     mediaDevices: {
-      async getUserMedia() {
+      async getUserMedia(constraints) {
         getUserMediaCalls++
+        lastConstraints = constraints
         const stream = makeStream()
         streams.push(stream)
         return stream
@@ -187,6 +189,9 @@ function installFakes({ ctxRunning = false } = {}) {
     ctx,
     get getUserMediaCalls() {
       return getUserMediaCalls
+    },
+    get lastConstraints() {
+      return lastConstraints
     },
     get workletNodeCount() {
       return workletNodeCount
@@ -455,6 +460,34 @@ test('a mic that keeps delivering audio is left alone by the watchdog', async ()
       await tick(20)
     }
     assert.equal(fakes.getUserMediaCalls, 1)
+  } finally {
+    fakes.restore()
+  }
+})
+
+// Wake during playback (16.10.26): the real capture path, not just the helpers.
+test('the mic is asked for with echo cancelling only, never noise suppression or auto gain', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    await connected(fakes)
+    assert.deepEqual(fakes.lastConstraints, {
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+    })
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('what reaches Jarvis carries the +12 dB the window adds back', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    fakes.nodes[0].port.onmessage({ data: new Float32Array(960).fill(0.01) }) // 20 ms at 48 kHz
+    const frames = sock.sent.filter((s) => s instanceof ArrayBuffer)
+    assert.equal(frames.length, 1)
+    const pcm = new Int16Array(frames[0])
+    assert.equal(pcm.length, 320, '20 ms at 16 kHz')
+    assert.ok(pcm.every((s) => s === Math.round(0.01 * 10 ** (12 / 20) * 32767)), `got ${pcm[0]}`)
   } finally {
     fakes.restore()
   }

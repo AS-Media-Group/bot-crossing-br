@@ -14,12 +14,42 @@ const MUTE_KEY = 'bc.jarvis.muted'
 const ACTIVE = new Set(['listening', 'thinking', 'speaking', 'followup'])
 
 /**
+ * How the mic is opened: echo cancelling only. Measured 16.10.26 on a MacBook's built-in speakers and
+ * mic: with Chrome's noise suppression and auto gain on as well, a "Hey Jarvis" said over Jarvis's
+ * voice came through about 11 dB down and mangled, and the wake word scored a flat 0.000. With echo
+ * cancelling alone Jarvis's voice was removed down to the room's floor and the speaker's came through
+ * whole. Echo cancelling must stay: without it Jarvis hears his own voice as the next question.
+ */
+export const MIC_CONSTRAINTS = Object.freeze({ channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: false })
+
+/**
+ * The level Chrome's auto gain used to add, given back as a fixed gain instead, so it never ducks
+ * while Jarvis talks. Without it speech peaked about -38 dBFS, where the wake word model begins to
+ * lose confidence; +12 dB puts it near -26, in the middle of the range where its score holds steady.
+ */
+export const MIC_GAIN_DB = 12
+
+/**
+ * Loud speech after the gain is bent smoothly under full scale rather than clipped: straight below
+ * the -6 dBFS knee, then a tanh curve that approaches but never passes 1.
+ */
+const KNEE = 0.5
+function softLimit(v) {
+  const m = Math.abs(v)
+  if (m <= KNEE) return v
+  return Math.sign(v) * (KNEE + (1 - KNEE) * Math.tanh((m - KNEE) / (1 - KNEE)))
+}
+
+/**
  * Microphone rate (48 kHz, or 44.1 kHz on some Macs) down to the 16 kHz speech models want: each
  * output sample is the average of the input samples it covers — a box filter, which is plenty for
  * speech. Stateful, because a 44.1 kHz chunk does not divide evenly and the leftover must carry over.
+ * `gainDb` other than 0 is applied to each output sample, through the soft limiter; at 0 the
+ * samples are exactly as before.
  */
-export function createDownsampler(inRate, outRate = MIC_RATE) {
+export function createDownsampler(inRate, outRate = MIC_RATE, gainDb = 0) {
   const step = inRate / outRate
+  const gain = 10 ** (gainDb / 20)
   let carry = new Float32Array(0)
   let pos = 0 // where the next output sample starts, in input samples from the start of `carry`
   return (chunk) => {
@@ -32,7 +62,8 @@ export function createDownsampler(inRate, outRate = MIC_RATE) {
       const b = Math.floor(pos + step)
       let sum = 0
       for (let j = a; j < b; j++) sum += input[j]
-      const v = b > a ? sum / (b - a) : input[a]
+      const avg = b > a ? sum / (b - a) : input[a]
+      const v = gainDb === 0 ? avg : softLimit(avg * gain)
       out.push(Math.max(-32768, Math.min(32767, Math.round(v * 32767))))
       pos += step
     }
@@ -167,9 +198,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     const sock = ws // the start is only still wanted while this exact socket is the live one
     let stream
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      })
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { ...MIC_CONSTRAINTS } })
     } catch {
       overlay = 'blocked'
       return show()
@@ -189,7 +218,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
       }
       const source = ctx.createMediaStreamSource(stream)
       const node = new AudioWorkletNode(ctx, 'jarvis-mic', { processorOptions: { chunk: Math.round(ctx.sampleRate / 50) } })
-      const down = createDownsampler(ctx.sampleRate)
+      const down = createDownsampler(ctx.sampleRate, MIC_RATE, MIC_GAIN_DB)
       const current = { stream, source, node, heardAt: Date.now() }
       node.port.onmessage = (e) => {
         current.heardAt = Date.now()
