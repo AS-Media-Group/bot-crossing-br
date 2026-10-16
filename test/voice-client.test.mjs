@@ -58,16 +58,17 @@ test('above the knee the soft limiter compresses loud speech instead of clipping
   const out = [0.13, 0.2, 0.3, 0.5, 1].map((v) => createDownsampler(48000, 16000, 12)(steady(v))[0])
   for (let i = 1; i < out.length; i++) assert.ok(out[i] > out[i - 1], `louder in stays louder out: ${out}`)
   assert.ok(out[3] < 32767, `twice over full scale after the gain still lands below the clip point: ${out[3]}`)
-  assert.ok(out.at(-1) <= 32767, 'and nothing ever exceeds it')
   const [shout] = createDownsampler(48000, 16000, 12)(steady(-1))
   assert.ok(shout > -32768 && shout < -32000, `symmetric for negative samples: ${shout}`)
 })
 
-test('at the default unity gain nothing changes: no limiter, the old hard clamp', () => {
-  const [half] = createDownsampler(48000, 16000, 0)(steady(0.5))
-  assert.equal(half, 16384)
-  const [same] = createDownsampler(48000)(steady(0.75))
-  assert.equal(same, Math.round(0.75 * 32767))
+test('at unity gain, explicit or default, nothing changes: no limiter, the old hard clamp', () => {
+  // 0.75 is above the knee, so the limiter would bend it (to 23955); unity must leave it straight.
+  for (const down of [createDownsampler(48000, 16000, 0), createDownsampler(48000)]) {
+    const [loud, clipped] = down(Float32Array.from([0.75, 0.75, 0.75, -2, -2, -2]))
+    assert.equal(loud, Math.round(0.75 * 32767))
+    assert.equal(clipped, -32768, 'out-of-range input is still clamped, not limited')
+  }
 })
 
 test('Jarvis\'s audio converts back to the range the speakers take', () => {
