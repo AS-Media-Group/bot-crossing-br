@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { backoffMs, createDownsampler, MIC_CONSTRAINTS, MIC_GAIN_DB, orbFor, pcm16ToFloat32 } from '../src/game/voice.js'
+import { backoffMs, createDownsampler, createDucker, DUCK, frameDb, MIC_CONSTRAINTS, MIC_GAIN_DB, orbFor, pcm16ToFloat32 } from '../src/game/voice.js'
 
 const tone = (n, rate) => Float32Array.from({ length: n }, (_, i) => 0.5 * Math.sin((2 * Math.PI * 440 * i) / rate))
 
@@ -69,6 +69,81 @@ test('at unity gain, explicit or default, nothing changes: no limiter, the old h
     assert.equal(loud, Math.round(0.75 * 32767))
     assert.equal(clipped, -32768, 'out-of-range input is still clamped, not limited')
   }
+})
+
+// Wake during playback, part 2 (16.10.26): with echo cancelling only, the voice of someone talking over
+// Jarvis reached the wake word at full strength, but what was left of Jarvis's voice under it still held
+// the score under the cutoff. So while Jarvis plays, a voice well above the room's floor ducks him.
+const DUCKED = 10 ** (-18 / 20) // 0.126
+
+test('frameDb: one 20 ms frame as dBFS, with silence floored at -120', () => {
+  assert.equal(Math.round(frameDb(new Int16Array(320).fill(3277)) * 10) / 10, -20)
+  assert.equal(frameDb(new Int16Array(320)), -120)
+  assert.equal(frameDb(new Int16Array(0)), -120)
+})
+
+test('the duck defaults are the measured ones', () => {
+  assert.deepEqual(DUCK, { marginDb: 15, minThresholdDb: -40, maxThresholdDb: -20, depthDb: -18, onsetFrames: 2, holdMs: 1200, floorStartDb: -60, floorRiseDb: 0.05, ignoreBelowDb: -100 })
+  assert.ok(Object.isFrozen(DUCK))
+})
+
+test('the floor falls at once to a quieter frame, creeps up slowly, and ignores digital silence', () => {
+  const d = createDucker()
+  assert.equal(d.floorDb, -60)
+  d.observe(-48, 0, false)
+  assert.equal(Math.round(d.floorDb * 100) / 100, -59.95, 'a louder frame lifts it only 0.05 dB')
+  d.observe(-70, 20, false)
+  assert.equal(d.floorDb, -70)
+  d.observe(-120, 40, false)
+  d.observe(-100, 60, false)
+  assert.equal(d.floorDb, -70, 'zeros from a mic just reopened are not the room')
+})
+
+test('the threshold sits 15 dB over the floor, kept between -40 and -20 dBFS', () => {
+  const at = (floor) => {
+    const d = createDucker({ ...DUCK, floorStartDb: floor })
+    return d.thresholdDb
+  }
+  assert.equal(at(-48), -33)
+  assert.equal(at(-70), -40, 'a very quiet floor never lets echo leftovers duck him')
+  assert.equal(at(-30), -20, 'a noisy room does not need a shout')
+})
+
+test('two loud frames in a row while Jarvis plays duck him; one is not enough', () => {
+  const d = createDucker({ ...DUCK, floorStartDb: -48 })
+  assert.equal(d.observe(-25, 0, true), 1, 'a single click or tap')
+  assert.equal(d.observe(-46, 20, true), 1)
+  assert.equal(d.observe(-25, 40, true), 1)
+  assert.equal(d.observe(-25, 60, true), DUCKED)
+})
+
+test('the duck holds 1200 ms after the last loud frame, and a loud frame extends it', () => {
+  const d = createDucker({ ...DUCK, floorStartDb: -48 })
+  d.observe(-25, 0, true)
+  assert.equal(d.observe(-25, 20, true), DUCKED)
+  assert.equal(d.observe(-47, 600, true), DUCKED)
+  assert.equal(d.observe(-25, 700, true), DUCKED, 'still talking')
+  assert.equal(d.observe(-47, 1899, true), DUCKED)
+  assert.equal(d.observe(-47, 1900, true), 1, '1200 ms after the last loud frame')
+})
+
+test('with Jarvis silent nothing is ducked, and a duck in progress clears', () => {
+  const d = createDucker({ ...DUCK, floorStartDb: -48 })
+  assert.equal(d.observe(-25, 0, false), 1)
+  assert.equal(d.observe(-25, 20, false), 1)
+  d.observe(-25, 40, true)
+  assert.equal(d.observe(-25, 60, true), DUCKED)
+  assert.equal(d.observe(-25, 80, false), 1, 'his audio ended')
+  assert.equal(d.observe(-47, 100, true), 1, 'the next sentence starts at full volume while the room is quiet')
+})
+
+test('reset clears a duck but keeps what it learned about the room', () => {
+  const d = createDucker({ ...DUCK, floorStartDb: -48 })
+  d.observe(-25, 0, true)
+  d.observe(-25, 20, true)
+  d.reset()
+  assert.equal(d.observe(-47, 40, true), 1)
+  assert.ok(d.floorDb < -47, `floor kept: ${d.floorDb}`)
 })
 
 test('Jarvis\'s audio converts back to the range the speakers take', () => {

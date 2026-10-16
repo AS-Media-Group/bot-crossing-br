@@ -92,8 +92,28 @@ const makeAudioContext = (startRunning) => {
     createBuffer(_channels, length, rate) {
       return { copyToChannel() {}, duration: length / rate }
     },
+    // What Jarvis's audio is wired to, and the duck node's gain as automation leaves it.
+    bufferSources: [],
+    gains: [],
     createBufferSource() {
-      return { connect() {}, start() {}, stop() {}, onended: null }
+      const src = { target: null, connect(t) { src.target = t }, start() {}, stop() {}, onended: null }
+      ctx.bufferSources.push(src)
+      return src
+    },
+    createGain() {
+      const node = {
+        target: null,
+        connect(t) { node.target = t },
+        gain: {
+          value: 1,
+          targets: [],
+          setTargetAtTime(v, _t, tc) { node.gain.targets.push([v, tc]); node.gain.value = v },
+          cancelScheduledValues() {},
+          setValueAtTime(v) { node.gain.value = v },
+        },
+      }
+      ctx.gains.push(node)
+      return node
     },
   }
   return ctx
@@ -488,6 +508,64 @@ test('what reaches Jarvis carries the +12 dB the window adds back', async () => 
     const pcm = new Int16Array(frames[0])
     assert.equal(pcm.length, 320, '20 ms at 16 kHz')
     assert.ok(pcm.every((s) => s === Math.round(0.01 * 10 ** (12 / 20) * 32767)), `got ${pcm[0]}`)
+  } finally {
+    fakes.restore()
+  }
+})
+
+// Wake during playback, part 2: ducking Jarvis while someone talks over him.
+const say = (sock, n = 2400) => {
+  sock.onmessage({ data: JSON.stringify({ type: 'audio-start', id: 'a-1', sampleRate: 24000 }) })
+  sock.onmessage({ data: new Int16Array(n).fill(1000).buffer }) // 100 ms of Jarvis
+}
+const micFrame = (fakes, v) => fakes.nodes[0].port.onmessage({ data: new Float32Array(960).fill(v) })
+
+test('Jarvis plays through one duck node on its way to the speakers', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    say(sock)
+    say(sock)
+    assert.equal(fakes.ctx.gains.length, 1, 'one duck node, made once')
+    assert.equal(fakes.ctx.gains[0].target, fakes.ctx.destination)
+    assert.equal(fakes.ctx.bufferSources.length, 2)
+    assert.ok(fakes.ctx.bufferSources.every((s) => s.target === fakes.ctx.gains[0]))
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a voice over Jarvis ducks him by 18 dB; the room on its own never does', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    say(sock)
+    const duck = fakes.ctx.gains[0]
+    for (let i = 0; i < 5; i++) micFrame(fakes, 0.0005) // about -54 dBFS after the gain: the room
+    assert.equal(duck.gain.value, 1)
+    micFrame(fakes, 0.1) // about -8 dBFS after the gain: someone talking
+    micFrame(fakes, 0.1)
+    assert.ok(Math.abs(duck.gain.value - 10 ** (-18 / 20)) < 1e-9, `ducked to ${duck.gain.value}`)
+    assert.equal(duck.gain.targets.at(-1)[1], 0.015, 'down fast')
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a hush puts Jarvis back to full volume at once, ready for the next answer', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    say(sock)
+    micFrame(fakes, 0.1)
+    micFrame(fakes, 0.1)
+    const duck = fakes.ctx.gains[0]
+    assert.ok(duck.gain.value < 0.2)
+    sock.onmessage({ data: JSON.stringify({ type: 'hush' }) })
+    assert.equal(duck.gain.value, 1)
+    micFrame(fakes, 0.1)
+    micFrame(fakes, 0.1)
+    assert.equal(duck.gain.value, 1, 'nothing is playing any more, so talking ducks nothing')
   } finally {
     fakes.restore()
   }

@@ -74,6 +74,75 @@ export function createDownsampler(inRate, outRate = MIC_RATE, gainDb = 0) {
   }
 }
 
+/**
+ * Ducking: with echo cancelling only, a voice over Jarvis reached the wake word at full strength, but
+ * what was left of Jarvis under it still held the score below the cutoff. So while Jarvis plays, a
+ * voice well over the room's floor turns him down 18 dB, until it has been quiet for 1.2 s. Levels are
+ * of the frames sent to Jarvis (after MIC_GAIN_DB); measured on a MacBook, Jarvis's echo-cancelled
+ * leftovers sat at -42 to -48 dBFS and a voice over him at -17 to -30.
+ */
+export const DUCK = Object.freeze({
+  marginDb: 15, // over the floor
+  minThresholdDb: -40, // never lower: echo leftovers must not duck him
+  maxThresholdDb: -20, // never higher: a noisy room should not need a shout
+  depthDb: -18,
+  onsetFrames: 2, // 40 ms, so a click or a tap does not
+  holdMs: 1200,
+  floorStartDb: -60,
+  floorRiseDb: 0.05, // a frame: 2.5 dB/s, so talking only slowly lifts the floor
+  ignoreBelowDb: -100, // digital zeros from a mic just opened are not the room
+})
+
+/** One frame of int16 samples as dBFS, with silence floored at -120. */
+export function frameDb(pcm) {
+  let sum = 0
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i]
+  const rms = pcm.length ? Math.sqrt(sum / pcm.length) : 0
+  return rms > 0 ? Math.max(-120, 20 * Math.log10(rms / 32768)) : -120
+}
+
+/**
+ * Fed one level per mic frame, the time in ms and whether Jarvis is audible; answers the gain he should
+ * play at (1, or DUCK.depthDb). The floor falls at once to any quieter frame and creeps up slowly, so
+ * it follows the room rather than the talking. Each frame is judged against the floor as it was.
+ */
+export function createDucker(o = DUCK) {
+  const depth = 10 ** (o.depthDb / 20)
+  let floor = o.floorStartDb
+  let run = 0
+  let ducked = false
+  let lastLoud = 0
+  const threshold = () => Math.min(o.maxThresholdDb, Math.max(o.minThresholdDb, floor + o.marginDb))
+  return {
+    get floorDb() {
+      return floor
+    },
+    get thresholdDb() {
+      return threshold()
+    },
+    observe(db, now, playing) {
+      const loud = db > threshold()
+      if (db > o.ignoreBelowDb) floor = db < floor ? db : floor + o.floorRiseDb
+      run = loud ? run + 1 : 0
+      if (!playing) {
+        ducked = false
+        return 1
+      }
+      if (loud && (ducked || run >= o.onsetFrames)) {
+        ducked = true
+        lastLoud = now
+      } else if (ducked && now - lastLoud >= o.holdMs) {
+        ducked = false
+      }
+      return ducked ? depth : 1
+    },
+    reset() {
+      ducked = false
+      run = 0
+    },
+  }
+}
+
 export function pcm16ToFloat32(int16) {
   const out = new Float32Array(int16.length)
   for (let i = 0; i < int16.length; i++) out[i] = int16[i] / 32768
@@ -139,6 +208,9 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
   let sources = []
   let playhead = 0
   let playedTimers = []
+  let duckNode = null // every say plays through this one GainNode, so a voice over Jarvis can turn him down
+  let duckGain = 1
+  const ducker = createDucker()
 
   // `taken` wins over everything else — a window that lost the mic stays visibly "taken" no matter
   // what Jarvis or a local mute does next, until orbClicked asks to reconnect. `unauthorized` is the
@@ -222,7 +294,10 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
       const current = { stream, source, node, heardAt: Date.now() }
       node.port.onmessage = (e) => {
         current.heardAt = Date.now()
-        if (ws?.readyState === WebSocket.OPEN && !muted) ws.send(down(e.data).buffer)
+        if (ws?.readyState !== WebSocket.OPEN || muted) return
+        const pcm = down(e.data)
+        setDuck(ducker.observe(frameDb(pcm), Date.now(), sources.length > 0))
+        ws.send(pcm.buffer)
       }
       source.connect(node)
       node.connect(ctx.destination) // silent: the worklet only runs while it reaches the speakers
@@ -314,7 +389,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     b.copyToChannel(samples, 0)
     const src = ctx.createBufferSource()
     src.buffer = b
-    src.connect(ctx.destination)
+    src.connect(duckOut())
     const at = Math.max(ctx.currentTime + 0.03, playhead)
     src.start(at)
     playhead = at + b.duration
@@ -348,6 +423,29 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     incoming = null
     playedTimers.forEach(clearTimeout)
     playedTimers = []
+    // The next answer starts at full volume, whatever was ducking this one.
+    ducker.reset()
+    duckGain = 1
+    if (duckNode) {
+      duckNode.gain.cancelScheduledValues(ctx.currentTime)
+      duckNode.gain.setValueAtTime(1, ctx.currentTime)
+    }
+  }
+
+  /** The one GainNode all of Jarvis's audio passes through, made on first use. */
+  function duckOut() {
+    if (!duckNode) {
+      duckNode = ctx.createGain()
+      duckNode.connect(ctx.destination)
+    }
+    return duckNode
+  }
+
+  /** Down in 15 ms, so the rest of a wake word lands on a quiet Jarvis; back up over about 120 ms. */
+  function setDuck(gain) {
+    if (!duckNode || gain === duckGain) return
+    duckGain = gain
+    duckNode.gain.setTargetAtTime(gain, ctx.currentTime, gain < 1 ? 0.015 : 0.12)
   }
 
   function onMessage(e) {
