@@ -83,7 +83,7 @@ export function createDownsampler(inRate, outRate = MIC_RATE, gainDb = 0) {
  */
 export const DUCK = Object.freeze({
   marginDb: 15, // over the floor
-  minThresholdDb: -40, // never lower: echo leftovers must not duck him
+  minThresholdDb: -36, // never lower: echo leftovers (loudest seen -42.6) must not duck him
   maxThresholdDb: -20, // never higher: a noisy room should not need a shout
   depthDb: -18,
   onsetFrames: 2, // 40 ms, so a click or a tap does not
@@ -296,7 +296,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
         current.heardAt = Date.now()
         if (ws?.readyState !== WebSocket.OPEN || muted) return
         const pcm = down(e.data)
-        setDuck(ducker.observe(frameDb(pcm), Date.now(), sources.length > 0))
+        setDuck(ducker.observe(frameDb(pcm), performance.now(), sources.length > 0))
         ws.send(pcm.buffer)
       }
       source.connect(node)
@@ -332,6 +332,7 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     mic.source.disconnect()
     mic.node.disconnect()
     mic = null
+    unduck() // no more frames will come to lift it
   }
 
   /** A fresh capture in place of one that died. getUserMedia failing shows the 'blocked' overlay. */
@@ -423,7 +424,11 @@ export function createVoice({ url, onState = () => {}, onHeard = () => {}, onAns
     incoming = null
     playedTimers.forEach(clearTimeout)
     playedTimers = []
-    // The next answer starts at full volume, whatever was ducking this one.
+    unduck() // the next answer starts at full volume, whatever was ducking this one
+  }
+
+  /** Only a mic frame or this lifts a duck, so it runs wherever either stops: playback, or the mic. */
+  function unduck() {
     ducker.reset()
     duckGain = 1
     if (duckNode) {

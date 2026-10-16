@@ -83,7 +83,7 @@ test('frameDb: one 20 ms frame as dBFS, with silence floored at -120', () => {
 })
 
 test('the duck defaults are the measured ones', () => {
-  assert.deepEqual(DUCK, { marginDb: 15, minThresholdDb: -40, maxThresholdDb: -20, depthDb: -18, onsetFrames: 2, holdMs: 1200, floorStartDb: -60, floorRiseDb: 0.05, ignoreBelowDb: -100 })
+  assert.deepEqual(DUCK, { marginDb: 15, minThresholdDb: -36, maxThresholdDb: -20, depthDb: -18, onsetFrames: 2, holdMs: 1200, floorStartDb: -60, floorRiseDb: 0.05, ignoreBelowDb: -100 })
   assert.ok(Object.isFrozen(DUCK))
 })
 
@@ -99,13 +99,14 @@ test('the floor falls at once to a quieter frame, creeps up slowly, and ignores 
   assert.equal(d.floorDb, -70, 'zeros from a mic just reopened are not the room')
 })
 
-test('the threshold sits 15 dB over the floor, kept between -40 and -20 dBFS', () => {
+test('the threshold sits 15 dB over the floor, kept between -36 and -20 dBFS', () => {
   const at = (floor) => {
     const d = createDucker({ ...DUCK, floorStartDb: floor })
     return d.thresholdDb
   }
   assert.equal(at(-48), -33)
-  assert.equal(at(-70), -40, 'a very quiet floor never lets echo leftovers duck him')
+  // Jarvis's loudest echo-cancelled leftover frame measured -42.6 dBFS: 6 dB of margin under -36.
+  assert.equal(at(-70), -36, 'a very quiet floor never lets echo leftovers duck him')
   assert.equal(at(-30), -20, 'a noisy room does not need a shout')
 })
 

@@ -571,6 +571,36 @@ test('a hush puts Jarvis back to full volume at once, ready for the next answer'
   }
 })
 
+test('a voice over audio still queued after audio-end still ducks Jarvis', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    say(sock)
+    sock.onmessage({ data: JSON.stringify({ type: 'audio-end', id: 'a-1' }) }) // all arrived, still playing
+    micFrame(fakes, 0.1)
+    micFrame(fakes, 0.1)
+    assert.ok(fakes.ctx.gains[0].gain.value < 0.2, `ducked to ${fakes.ctx.gains[0].gain.value}`)
+  } finally {
+    fakes.restore()
+  }
+})
+
+test('a mic that dies while Jarvis is ducked lets him back up at once', async () => {
+  const fakes = installFakes({ ctxRunning: true })
+  try {
+    const { sock } = await connected(fakes)
+    say(sock)
+    micFrame(fakes, 0.1)
+    micFrame(fakes, 0.1)
+    const duck = fakes.ctx.gains[0]
+    assert.ok(duck.gain.value < 0.2)
+    fakes.streams[0].track.onended() // sleep, or a headset pulled: no more frames to lift the duck
+    assert.equal(duck.gain.value, 1, 'the rest of his answer plays at full volume')
+  } finally {
+    fakes.restore()
+  }
+})
+
 test('the watchdog never restarts a mic while the audio context is not running', async () => {
   const fakes = installFakes({ ctxRunning: true })
   try {
