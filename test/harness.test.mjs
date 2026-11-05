@@ -990,3 +990,82 @@ test('a Cowork session running on this machine now is working; a VM one, or a qu
     await cleanup()
   }
 })
+
+// ── sessions a program started, and titles the app has not filled in ──────────
+
+const RECENT = () => ago(5 * MINUTE)
+
+test('a script-started session is not an astronaut, but one with a title of its own is', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const review = randomUUID()
+    const named = randomUUID()
+    const sdkRecord = randomUUID()
+    const prompt = 'Review this change for security vulnerabilities. Changed files: a.mjs b.mjs'
+    await writeTranscript(h, '/tmp/repo', review, [userSays(prompt, { entrypoint: 'sdk-py', cwd: '/tmp/repo', timestamp: RECENT() })])
+    await writeTranscript(h, '/tmp/repo', named, [
+      userSays('scripted job', { entrypoint: 'sdk-py', cwd: '/tmp/repo', timestamp: RECENT() }),
+      { type: 'custom-title', customTitle: 'Nightly export', sessionId: named },
+    ])
+    // The app adopted a script's transcript as an untitled record: still the script's, still hidden.
+    await writeTranscript(h, '/tmp/repo', sdkRecord, [userSays(prompt, { entrypoint: 'sdk-py', cwd: '/tmp/repo', timestamp: RECENT() })])
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: sdkRecord, cwd: '/tmp/repo', createdAt: Date.now() - MINUTE, adoptedFromOtherSurface: true,
+    })
+    const titles = (await h.scanThreads()).map((t) => t.title)
+    assert.deepEqual(titles, ['Nightly export'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a headless child with no app record is hidden; a terminal session and an app-recorded SDK session stay', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const spike = randomUUID()
+    const terminal = randomUUID()
+    const bare = randomUUID()
+    const agentApp = randomUUID()
+    await writeTranscript(h, '/tmp/spike', spike, [userSays("Remember the word 'kestrel'", { entrypoint: 'claude-desktop', cwd: '/tmp/spike', timestamp: RECENT() })])
+    await writeTranscript(h, '/Users/a/proj', terminal, [userSays('fix the build', { entrypoint: 'cli', cwd: '/Users/a/proj', timestamp: RECENT() })])
+    await writeTranscript(h, '/Users/a/old', bare, [userSays('from before entrypoints existed', { cwd: '/Users/a/old', timestamp: RECENT() })])
+    await writeTranscript(h, '/Users/a/studio', agentApp, [userSays('make some clips', { entrypoint: 'sdk-ts', cwd: '/Users/a/studio', timestamp: RECENT() })])
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cliSessionId: agentApp, cwd: '/Users/a/studio', title: 'make some clips', createdAt: Date.now() - MINUTE,
+    })
+    const titles = (await h.scanThreads()).map((t) => t.title).sort()
+    assert.deepEqual(titles, ['fix the build', 'from before entrypoints existed', 'make some clips'])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('a placeholder app title gives way to the transcript, and a long prompt is not a title', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    const rcPrompt = randomUUID()
+    const rcNamed = randomUUID()
+    const rcBare = randomUUID()
+    const long = `Review the whole of ${'the repository and everything in it, '.repeat(10)}`
+    await writeTranscript(h, '/tmp/a', rcPrompt, [userSays('Check the calendar sync', { cwd: '/tmp/a', timestamp: RECENT() })])
+    await writeTranscript(h, '/tmp/b', rcNamed, [
+      userSays('whatever', { cwd: '/tmp/b', timestamp: RECENT() }),
+      { type: 'custom-title', customTitle: 'Calendar sync', sessionId: rcNamed },
+    ])
+    await writeTranscript(h, '/tmp/c', rcBare, [userSays(long, { cwd: '/tmp/c', timestamp: RECENT() })])
+    const placeholder = 'Remote Control session (from a project)'
+    for (const [id, cwd] of [[rcPrompt, '/tmp/a'], [rcNamed, '/tmp/b']]) {
+      await writeDesktopRecord(h, { sessionId: desktopId(), cliSessionId: id, cwd, title: placeholder, titleSource: 'auto', createdAt: Date.now() - MINUTE })
+    }
+    // No transcript to name it from: the placeholder is all there is, and it is only kept while the record is fresh.
+    await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/d', title: placeholder, createdAt: Date.now() - MINUTE })
+    const titles = (await h.scanThreads()).map((t) => t.title)
+    assert.ok(titles.includes('Remote Control: Check the calendar sync'), titles.join(' | '))
+    assert.ok(titles.includes('Calendar sync'), 'a real transcript title beats the placeholder, with no prefix')
+    assert.ok(titles.includes(placeholder), 'nothing better to say, so the placeholder stands')
+    const longTitle = titles.find((t) => t.startsWith('Review the whole'))
+    assert.ok(longTitle && longTitle.length <= 80 && longTitle.endsWith('…'), longTitle)
+  } finally {
+    await cleanup()
+  }
+})
