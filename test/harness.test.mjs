@@ -1057,14 +1057,33 @@ test('a placeholder app title gives way to the transcript, and a long prompt is 
     for (const [id, cwd] of [[rcPrompt, '/tmp/a'], [rcNamed, '/tmp/b']]) {
       await writeDesktopRecord(h, { sessionId: desktopId(), cliSessionId: id, cwd, title: placeholder, titleSource: 'auto', createdAt: Date.now() - MINUTE })
     }
-    // No transcript to name it from: the placeholder is all there is, and it is only kept while the record is fresh.
+    // Nothing to name it from: the project and the date tell it apart from its twins.
     await writeDesktopRecord(h, { sessionId: desktopId(), cwd: '/tmp/d', title: placeholder, createdAt: Date.now() - MINUTE })
     const titles = (await h.scanThreads()).map((t) => t.title)
     assert.ok(titles.includes('Remote Control: Check the calendar sync'), titles.join(' | '))
     assert.ok(titles.includes('Calendar sync'), 'a real transcript title beats the placeholder, with no prefix')
-    assert.ok(titles.includes(placeholder), 'nothing better to say, so the placeholder stands')
+    assert.ok(titles.some((t) => /^Remote Control session · d · \d{1,2} \w{3}$/.test(t)), titles.join(' | '))
+    assert.ok(!titles.includes(placeholder), 'the bare placeholder is never shown')
     const longTitle = titles.find((t) => t.startsWith('Review the whole'))
     assert.ok(longTitle && longTitle.length <= 80 && longTitle.endsWith('…'), longTitle)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('"Local session (from a project)" is a placeholder too, and an app title that merely contains the phrase is left alone', async () => {
+  const { h, cleanup } = await fakeClaude()
+  try {
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cwd: '/tmp/vault', title: 'Local session (from a project)', createdAt: Date.now() - MINUTE,
+    })
+    await writeDesktopRecord(h, {
+      sessionId: desktopId(), cwd: '/tmp/vault', title: 'Why "(from a project)" sessions are untitled', createdAt: Date.now() - MINUTE,
+    })
+    const titles = (await h.scanThreads()).map((t) => t.title).sort()
+    assert.equal(titles.length, 2)
+    assert.ok(titles.some((t) => /^Local session · vault · \d{1,2} \w{3}$/.test(t)), titles.join(' | '))
+    assert.ok(titles.includes('Why "(from a project)" sessions are untitled'))
   } finally {
     await cleanup()
   }

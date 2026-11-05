@@ -413,7 +413,22 @@ function tidyTitle(title) {
  * way — fourteen astronauts with one name. These are placeholders, not titles: the thread is named
  * from its transcript instead, and keeps the placeholder only when the transcript has nothing better.
  */
-const PLACEHOLDER_TITLE = /^(remote control session|untitled( thread| session)?|new (chat|conversation|session|thread))\b/i
+const PLACEHOLDER_TITLE =
+  /^(remote control session|local session|untitled( thread| session)?|new (chat|conversation|session|thread))\b|\(from a project\)\s*$/i
+
+/**
+ * What to call a project-spawned session when nothing in its transcript can name it. Its first
+ * record is wrapped in a context block, so there is no plain first prompt to borrow, and fourteen
+ * threads called "Remote Control session (from a project)" are indistinguishable. Where it ran and
+ * when are the two things that do tell them apart.
+ */
+function describeSession(title, project, whenMs) {
+  if (!/\(from a project\)\s*$/i.test(title)) return title
+  const label = title.replace(/\s*\(from a project\)\s*$/i, '').trim()
+  const parts = [label, project && project !== 'unknown' ? project : '']
+  if (whenMs) parts.push(new Date(whenMs).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }))
+  return parts.filter(Boolean).join(' · ')
+}
 
 /** The CLI's own title precedence — custom, then AI, then summary, then first prompt — latest first. */
 const titleOf = (meta, tail) =>
@@ -689,7 +704,9 @@ async function scanThreads() {
     const fromTranscript = titleOf(meta, tail)
     const kind = /^remote control/i.test(s.title || '') ? 'Remote Control: ' : ''
     const title = placeholder
-      ? (fromTranscript ? `${hasOwnTitle(meta, tail) ? '' : kind}${fromTranscript}` : s.title)
+      ? (fromTranscript
+          ? `${hasOwnTitle(meta, tail) ? '' : kind}${fromTranscript}`
+          : describeSession(s.title, project, num(s.createdAt) || meta?.startedAt || 0))
       : s.title || fromTranscript || 'Untitled thread'
 
     add({
