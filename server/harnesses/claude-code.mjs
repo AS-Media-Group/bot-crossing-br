@@ -160,8 +160,10 @@ function cleanPrompt(s) {
 function readTranscriptMeta(records) {
   const meta = {
     customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0, rootUuid: '',
+    entrypoint: '',
   }
   for (const r of records) {
+    if (!meta.entrypoint && typeof r.entrypoint === 'string') meta.entrypoint = r.entrypoint
     if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
     if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
     if (!meta.summary && r.type === 'summary' && r.summary) meta.summary = r.summary
@@ -394,9 +396,56 @@ async function transcriptTail(entry) {
 /** When a transcript last did something: its last timestamped record, or its mtime if it has none. */
 const activityOf = (entry, tail) => tail.lastRecordAt || entry.mtime
 
+/**
+ * The longest a title is allowed to be. A thread with no title of its own is named after its first
+ * prompt, and a prompt can be a whole pasted diff: three hundred characters of "Review this change
+ * for security vulnerabilities. Changed files…" made a nameplate nobody could read.
+ */
+const TITLE_CHARS = 80
+function tidyTitle(title) {
+  const t = String(title || '').replace(/\s+/g, ' ').trim()
+  return t.length > TITLE_CHARS ? `${t.slice(0, TITLE_CHARS - 1).trimEnd()}…` : t
+}
+
+/**
+ * Titles the desktop app writes before it has anything to say. A Remote Control session is born
+ * "Remote Control session (from a project)" and, because its title is never regenerated, stays that
+ * way — fourteen astronauts with one name. These are placeholders, not titles: the thread is named
+ * from its transcript instead, and keeps the placeholder only when the transcript has nothing better.
+ */
+const PLACEHOLDER_TITLE = /^(remote control session|untitled( thread| session)?|new (chat|conversation|session|thread))\b/i
+
 /** The CLI's own title precedence — custom, then AI, then summary, then first prompt — latest first. */
 const titleOf = (meta, tail) =>
-  tail?.customTitle || meta?.customTitle || tail?.aiTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || ''
+  tidyTitle(
+    tail?.customTitle || meta?.customTitle || tail?.aiTitle || meta?.aiTitle || meta?.summary || meta?.firstPrompt || ''
+  )
+
+/** A title somebody (or the model, deliberately) gave the transcript — not a prompt standing in for one. */
+const hasOwnTitle = (meta, tail) =>
+  Boolean(tail?.customTitle || meta?.customTitle || tail?.aiTitle || meta?.aiTitle)
+
+/**
+ * A session a program started, not a person.
+ *
+ * Python-SDK runs (the security-review reviewers, scripted jobs) and the throwaway sessions Jarvis's
+ * own spikes and smokes open leave real transcripts, and the desktop app even adopts some of them as
+ * untitled records. Each one became an astronaut named after its prompt. A transcript carries the
+ * entrypoint that started it:
+ *
+ *   - `sdk-py` is always a script, unless something gave the transcript a title of its own.
+ *   - any other `sdk-*`, or `claude-desktop`, with no desktop record is a headless child of
+ *     something else — the app writes a record for every thread a person opens.
+ *   - `cli` is a person at a terminal, and an unrecorded or empty entrypoint says nothing: both stay.
+ *
+ * An SDK session the app *does* have a record for stays (it is somebody's work in an agent app).
+ */
+function isHeadless(meta, tail, hasAppRecord) {
+  const entrypoint = meta?.entrypoint || ''
+  if (!entrypoint || hasOwnTitle(meta, tail)) return false
+  if (entrypoint === 'sdk-py') return true
+  return !hasAppRecord && (entrypoint.startsWith('sdk') || entrypoint === 'claude-desktop')
+}
 
 /**
  * Where a terminal thread works. Its transcript's folder is named after the cwd it lives in *now*
@@ -500,6 +549,7 @@ function mergeThread(existing, next) {
     ...next,
     title: better(existing.title, next.title),
     titled: existing.titled || next.titled,
+    headless: existing.headless && next.headless,
     preview: existing.preview || next.preview,
     desktopSessionId: keepExisting ? existing.desktopSessionId : next.desktopSessionId,
     desktopSessionIds: [...new Set([...existing.desktopSessionIds, ...next.desktopSessionIds])],
@@ -533,7 +583,7 @@ function mergeThread(existing, next) {
 function toThread(t) {
   const {
     desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId,
-    titled, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, handedBack, handedBackAt, ...rest
+    titled, headless, hasLiveProcess, transcriptFile, recordActivityAt, hasFocusStamp, handedBack, handedBackAt, ...rest
   } = t
   return {
     ...rest,
@@ -633,14 +683,24 @@ async function scanThreads() {
       rootOwners.set(meta.rootUuid, owners)
     }
 
+    // A placeholder is not a title (see PLACEHOLDER_TITLE): name the thread from its transcript, and
+    // say what kind of session it is when the transcript has only a prompt to offer.
+    const placeholder = Boolean(s.title) && PLACEHOLDER_TITLE.test(s.title)
+    const fromTranscript = titleOf(meta, tail)
+    const kind = /^remote control/i.test(s.title || '') ? 'Remote Control: ' : ''
+    const title = placeholder
+      ? (fromTranscript ? `${hasOwnTitle(meta, tail) ? '' : kind}${fromTranscript}` : s.title)
+      : s.title || fromTranscript || 'Untitled thread'
+
     add({
       id: ID(cliSessionId || s.sessionId),
       cliSessionId,
       desktopSessionId: s.sessionId || '',
       desktopSessionIds: s.sessionId ? [s.sessionId] : [],
-      titled: Boolean(s.title),
+      titled: Boolean(s.title) && !placeholder,
+      headless: entry ? isHeadless(meta, tail, true) : false,
       bridgeSessionId: (s.bridgeSessionIds && s.bridgeSessionIds[0]) || '',
-      title: s.title || titleOf(meta, tail) || 'Untitled thread',
+      title: tidyTitle(title),
       preview: meta?.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
       project,
       projectPath,
@@ -695,7 +755,8 @@ async function scanThreads() {
       cliSessionId: id,
       desktopSessionId: '',
       desktopSessionIds: [],
-      titled: Boolean(tail.customTitle || meta.customTitle || tail.aiTitle || meta.aiTitle),
+      titled: hasOwnTitle(meta, tail),
+      headless: isHeadless(meta, tail, false),
       bridgeSessionId: '',
       title: titleOf(meta, tail) || 'Untitled thread',
       preview: meta.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
@@ -742,10 +803,11 @@ async function scanThreads() {
   const NEW_SESSION_MS = 10 * 60 * 1000
   const threads = [...byId.values()].filter(
     (t) =>
-      t.hasTranscript ||
+      !t.headless &&
+      (t.hasTranscript ||
       t.titled ||
       t.hasLiveProcess ||
-      now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS
+      now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS)
   )
 
   // Unread = the thread moved on after you last looked at it; a recent thread never opened counts
